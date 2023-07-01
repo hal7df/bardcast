@@ -15,7 +15,6 @@ use crate::snd::pulse::owned::{
     OwnedSinkInputInfo,
     OwnedSourceInfo
 };
-use crate::util;
 use super::{PulseContextWrapper, PulseResultRef};
 use super::collect;
 
@@ -155,7 +154,7 @@ impl AsyncIntrospector {
         self.do_default(|introspect, result| introspect.get_sink_info_list(move |sink_info| {
             if let Some(_) = collect::filter_list(
                 sink_info,
-                |info| util::opt_is_some_and(&info.name, |name| name.starts_with(&prefix))
+                |info| info.name.as_ref().is_some_and(|name| name.starts_with(&prefix))
             ) {
                 collect::increment(&result);
             }

@@ -1,9 +1,10 @@
 [package]
 name = "bardcast"
-version = "0.1.0"
+version = "0.1.1"
 authors = ["Paul Bonnen <hal7df@gmail.com>"]
 license = "GPL-3.0-or-later"
 edition = "2021"
+rust-version = "1.70.0"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -14,7 +15,6 @@ pulse = ["dep:libpulse-binding"]
 [dependencies]
 async-ringbuf = "0.1.2"
 async-trait = "0.1.60"
-atty = "0.2"
 byteorder = "1.4.3"
 clap = { version = "3.2.22", features = ["cargo", "derive"] }
 configparser = "3.0.2"
@@ -25,7 +25,7 @@ log = "0.4.17"
 regex = "1.6.0"
 ringbuf = "0.3.2"
 simple_logger = { version = "4.0.0", features = ["timestamps","colored","stderr","threads"] }
-songbird = { version = "0.3.2", features = ["serenity-native"] }
+songbird = { version = "0.3.2", features = ["serenity-rustls"] }
 stream-flatten-iters = "0.2.0"
 time = { version = "0.3.17", features = ["local-offset"] }
 tokio = { version = "~1.28", features = ["full"] }
@@ -42,6 +42,6 @@ features = [
     "model",
     "http",
     "utils",
-    "native_tls_backend",
+    "rustls_backend",
     "voice"
 ]

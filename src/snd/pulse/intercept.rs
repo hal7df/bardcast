@@ -17,7 +17,6 @@ use log::{debug, error, warn};
 
 use libpulse::error::Code;
 
-use crate::util;
 use super::PulseFailure;
 use super::context::AsyncIntrospector;
 use super::owned::OwnedSinkInfo;
@@ -291,11 +290,9 @@ async fn get_created_virtual_sink<S: ToString>(
     //by appending characters to it, so we do a substring search on the sink
     //name instead of a string comparison.
     introspect.get_sinks().await?.drain(..)
-        .filter(|sink| util::opt_is_some_and(
-            &sink.name,
+        .filter(|sink| sink.name.as_ref().is_some_and(
             |name| name.contains(&sink_name)
-        ) && util::opt_is_some_and(
-            &sink.owner_module,
+        ) && sink.owner_module.as_ref().is_some_and(
             |owner_module| *owner_module == mod_idx
         ))
         .next().ok_or(PulseFailure::Error(Code::NoEntity))
