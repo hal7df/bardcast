@@ -30,15 +30,3 @@ pub fn check_oneshot_rx(rx: &mut OneshotReceiver<()>) -> bool {
         false
     }
 }
-
-///! Manual reimplementation for [`Option::is_some_and`] for compatibility with
-///! stable Rust versions prior to 1.70.0.
-///!
-///! TODO: This should be removed after support for older versions is dropped.
-pub fn opt_is_some_and<T, F: FnOnce(&T) -> bool>(opt: &Option<T>, predicate: F) -> bool {
-    if let Some(t) = opt.as_ref() {
-        predicate(t)
-    } else {
-        false
-    }
-}

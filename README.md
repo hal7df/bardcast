@@ -25,6 +25,9 @@ Each audio driver has its own feature flag; the most common servers are enabled
 by default, but can be disabled by passing `--no-default-features` to `cargo`
 and manually specifying the drivers you want.
 
+The minimum supported Rust version for this project is **1.70.0**. This will be
+updated on an as-needed basis.
+
 # Setup
 Unlike most Discord bots, there is no quick link to add bardcast to your
 server -- because bardcast runs on your machine (rather than on a server), you

@@ -122,7 +122,6 @@ version = "0.1.0"
 dependencies = [
  "async-ringbuf",
  "async-trait",
- "atty",
  "byteorder",
  "clap",
  "configparser",

@@ -25,7 +25,6 @@ use libpulse::proplist::properties::{
 };
 
 use crate::cfg::InterceptMode;
-use crate::util;
 use crate::util::task::{TaskSetBuilder, ValueJoinHandle};
 use self::intercept::{Interceptor, CapturingInterceptor, PeekingInterceptor};
 use self::context::{AsyncIntrospector, PulseContextWrapper, SampleConsumer};
@@ -310,7 +309,7 @@ async fn initialize(
         shutdown_rx
     );
 
-    let monitor_mode = util::opt_is_some_and(&config.intercept_mode, |mode| *mode == InterceptMode::Monitor);
+    let monitor_mode = config.intercept_mode.as_ref().is_some_and(|mode| *mode == InterceptMode::Monitor);
 
     // Determine the sink to read audio samples from
     let rec_name = if monitor_mode {

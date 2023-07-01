@@ -4,9 +4,9 @@ mod sample_log;
 mod snd;
 mod util;
 
+use std::io::{self, IsTerminal};
 use std::process::ExitCode;
 
-use atty::Stream;
 use clap::{crate_name, crate_version, crate_authors, CommandFactory, Parser};
 use futures::future::{FusedFuture, FutureExt};
 use log::{LevelFilter, debug, info, warn, error};
@@ -114,7 +114,7 @@ fn init_logger(config: &ApplicationConfig, default_log_level: LevelFilter) {
         .with_level(log_level)
         .env()
         .with_local_timestamps()
-        .with_colors(atty::is(Stream::Stderr));
+        .with_colors(io::stderr().is_terminal());
 
     //these third-party modules are very noisy at info level, so make them
     //quieter if not debugging
