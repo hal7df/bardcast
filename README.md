@@ -10,16 +10,20 @@ other OSes and sound servers may be added in the future.
 # Building
 bardcast needs the following libraries available on your system:
 
-  * `libopus` (via [Songbird](https://github.com/serenity-rs/songbird#dependencies)):
-  * openssl (Linux only)
-    * This dependency can be removed by editing `Cargo.toml` to change the
-      SSL implementation for Serenity to use `rustls_backend`.
+  * `libopus` (via [Songbird](https://github.com/serenity-rs/songbird#dependencies))
+  * Linux only
+    * `libpulse` (if using the default `pulse` feature for PulseAudio support)
+      * Debian/Ubuntu: `libpulse-dev`
+      * Fedora: `pulseaudio-libs-devel`
+      * openSUSE: `libpulse-devel`
+      * Arch: `libpulse`
 
 Once these dependencies are installed, simply run `cargo build -r` to create a
 release build of bardcast.
 
 Each audio driver has its own feature flag; the most common servers are enabled
-by default, but can be disabled by passing `--no-default-features` to `cargo`.
+by default, but can be disabled by passing `--no-default-features` to `cargo`
+and manually specifying the drivers you want.
 
 # Setup
 Unlike most Discord bots, there is no quick link to add bardcast to your
