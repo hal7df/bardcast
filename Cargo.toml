@@ -1,6 +1,6 @@
 [package]
 name = "bardcast"
-version = "0.1.0"
+version = "0.1.1"
 authors = ["Paul Bonnen <hal7df@gmail.com>"]
 license = "GPL-3.0-or-later"
 edition = "2021"
