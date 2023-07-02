@@ -47,6 +47,15 @@ pub struct PulseDriverConfig {
     ///
     /// This option takes precedence over [`sink_name`] if both are set.
     pub sink_index: Option<u32>,
+
+    /// The maximum duration between mainloop iterations.
+    ///
+    /// bardcast tries to detect the appropriate maximum delay before the next
+    /// iteration of the mainloop automatically, but caps its maximum value to
+    /// prevent audio stuttering in the worst case. The default value
+    /// (20 ms/20000 us) should work in most cases, but the control is exposed
+    /// here in case your hardware requires a shorter max interval.
+    pub max_mainloop_interval_usec: Option<u64>,
 }
 
 // TRAIT IMPLS *****************************************************************
@@ -72,6 +81,7 @@ impl TryFrom<&Args> for PulseDriverConfig {
             sink_name,
             volume: validate_volume(args.volume.clone())?,
             sink_index,
+            max_mainloop_interval_usec: None,
         })
     }
 }
@@ -86,6 +96,7 @@ impl<'a> Config<'a> for PulseDriverConfig {
             sink_name: config.get(pulse::DRIVER_NAME, "sink-name"),
             volume: validate_volume(config.getfloat(pulse::DRIVER_NAME, "volume")?)?,
             sink_index: validate_sink_index(config.getuint(pulse::DRIVER_NAME, "sink-index"))?,
+            max_mainloop_interval_usec: config.getuint(pulse::DRIVER_NAME, "max-mainloop-interval-usec")?,
         })
     }
 
@@ -94,6 +105,10 @@ impl<'a> Config<'a> for PulseDriverConfig {
         cfg::merge_opt(&mut self.stream_regex, other.stream_regex);
         cfg::merge_opt(&mut self.server, other.server);
         cfg::merge_opt(&mut self.volume, other.volume);
+        cfg::merge_opt(
+            &mut self.max_mainloop_interval_usec,
+            other.max_mainloop_interval_usec
+        );
 
         // Reset the fallback sink index if the override specifies a sink name.,
         // The sink index takes precedence over the sink name if present, but

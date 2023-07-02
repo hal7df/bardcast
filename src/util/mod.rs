@@ -20,13 +20,3 @@ pub fn check_shutdown_rx(rx: &mut WatchReceiver<bool>) -> bool {
         false
     }
 }
-
-///! Checks whether the given unit [`OneshotReceiver`] has received a
-///! notification, without `await`ing.
-pub fn check_oneshot_rx(rx: &mut OneshotReceiver<()>) -> bool {
-    if let Err(e) = rx.try_recv() {
-        e == TryRecvError::Empty
-    } else {
-        false
-    }
-}
