@@ -143,7 +143,10 @@ pub async fn start_driver(
     config: &PulseDriverConfig,
     shutdown_rx: WatchReceiver<bool>
 ) -> Result<Driver, DriverStartError> {
-    let (ctx, ctx_task) = connect(config.server.as_deref()).await
+    let (ctx, ctx_task) = connect(
+        config.server.as_deref(),
+        config.max_mainloop_interval_usec
+    ).await
         .map_err(|e| DriverStartError::ConnectionFailure(
             format!("Failed to connect to PulseAudio ({})", e)
         ))?.into_tuple();
@@ -287,8 +290,14 @@ async fn start_stream_intercept(
 /// Connects to the PulseAudio server at the given socket. If not specified,
 /// connects to an automatically-chosen PulseAudio server using the underlying
 /// libpulse server discovery logic.
-async fn connect(server: Option<&str>) -> Result<ValueJoinHandle<PulseContextWrapper>, PulseFailure> {
-    let ctx = PulseContextWrapper::new(server).await?;
+async fn connect(
+    server: Option<&str>,
+    max_mainloop_interval_usec: Option<u64>
+) -> Result<ValueJoinHandle<PulseContextWrapper>, PulseFailure> {
+    let ctx = PulseContextWrapper::new(
+        server,
+        max_mainloop_interval_usec
+    ).await?;
     info!("Connected to PulseAudio server");
 
     Ok(ctx)

@@ -6,16 +6,29 @@ mod introspect;
 
 extern crate libpulse_binding as libpulse;
 
+use std::cmp;
+use std::future::Future;
 use std::mem;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use async_ringbuf::{AsyncConsumer, AsyncProducer, AsyncRb};
 use clap::crate_name;
+use itertools::Itertools;
 use log::{debug, error, warn, trace};
 use ringbuf::HeapRb;
-use tokio::sync::mpsc::{self, Sender as MpscSender, Receiver};
-use tokio::sync::oneshot::{self, Sender as OneshotSender};
-use tokio::task::{self, JoinHandle};
+use tokio::sync::mpsc::{
+    self,
+    Sender as MpscSender,
+    Receiver as MpscReceiver
+};
+use tokio::sync::oneshot::{
+    self,
+    Receiver as OneshotReceiver,
+    Sender as OneshotSender
+};
+use tokio::task::{self, JoinError, JoinHandle};
+use tokio::time;
 
 use libpulse::channelmap::Map as ChannelMap;
 use libpulse::context::{Context, FlagSet, State as ContextState};
@@ -36,7 +49,6 @@ use self::async_polyfill::{
     StreamReadNotifier
 };
 use super::PulseFailure;
-use crate::util;
 use crate::util::task::ValueJoinHandle;
 
 // RE-EXPORTS ******************************************************************
@@ -66,6 +78,13 @@ const SAMPLE_SPEC: SampleSpec = SampleSpec {
     rate: SAMPLE_RATE,
 };
 
+/// The default maximum interval between mainloop iterations.
+const DEFAULT_MAINLOOP_MAX_INTERVAL: Duration = Duration::from_millis(20);
+
+/// The number of iterations over which to compute the delay for the next
+/// mainloop iteration.
+const MAINLOOP_ITER_TRACKING_LEN: usize = 5;
+
 // TYPE DEFINITIONS ************************************************************
 
 /// Type alias for the concrete audio consumer type.
@@ -85,13 +104,31 @@ pub struct PulseContextWrapper {
     op_queue: MpscSender<ContextThunk>,
 }
 
+/// Utility type for managing the mainloop.
+///
+/// Simply using [`tokio::task::yield_now()`] to inject an await into the
+/// mainloop causes the mainloop to poll far more often than necessary.
+/// `MainloopHandler` uses the number of dispatched events on each iteration to
+/// guess when the next iteration _should_ be, and sleeps the mainloop
+/// accordingly.
+struct MainloopHandler {
+    mainloop: Mainloop,
+    iter_lengths: [(Instant, u32); MAINLOOP_ITER_TRACKING_LEN],
+    last_iter: Instant,
+    max_interval: Duration,
+}
+
+/// A handle to cancel an actively running [`MainloopHandler`].
+struct MainloopHandle(OneshotSender<()>, JoinHandle<()>);
+
 // TYPE IMPLS ******************************************************************
 impl PulseContextWrapper {
     /// Creates a new wrapper instance, returning the new instance wrapped in a
     /// [`ValueJoinHandle`] alongside the handle for the background task for
     /// tracking.
     pub async fn new(
-        server: Option<&str>
+        server: Option<&str>,
+        max_mainloop_interval_usec: Option<u64>
     ) -> Result<ValueJoinHandle<Self>, PulseFailure> {
         let (op_queue_tx, op_queue_rx) = mpsc::channel::<ContextThunk>(
             OP_QUEUE_SIZE
@@ -99,7 +136,11 @@ impl PulseContextWrapper {
 
         Ok(ValueJoinHandle::new(
             Self { op_queue: op_queue_tx },
-            start_context_handler(server, op_queue_rx).await?
+            start_context_handler(
+                server,
+                max_mainloop_interval_usec,
+                op_queue_rx
+            ).await?
         ))
     }
 
@@ -294,56 +335,163 @@ impl PulseContextWrapper {
     }
 }
 
-/// Starts a local task that iterates the libpulse [`Mainloop`] object,
-/// returning the task's handle and a sender handle that can be used to shut
-/// down the mainloop.
-fn start_mainloop(mut mainloop: Mainloop) -> ValueJoinHandle<OneshotSender<()>> {
-    let (tx, mut rx) = oneshot::channel();
+impl MainloopHandler {
+    /// Creates a new handler over the given mainloop, where each iteration
+    /// lasts no longer than `max_interval`.
+    fn new(mainloop: Mainloop, max_interval: Duration) -> Self {
+        let now = Instant::now();
 
-    ValueJoinHandle::new(tx, task::spawn_local(async move {
+        Self {
+            mainloop,
+            iter_lengths: [(now, 0); MAINLOOP_ITER_TRACKING_LEN],
+            last_iter: now,
+            max_interval,
+        }
+    }
+
+    /// Saves the number of processed events, if that number is nonzero. Also
+    /// updates the last recorded iteration time as `iter_time`.
+    fn save_processed_events(
+        &mut self,
+        iter_time: Instant,
+        processed_events: u32
+    ) {
+        let mut new_iteration = (iter_time, processed_events);
+
+        for iteration in self.iter_lengths.iter_mut() {
+            if new_iteration.1 == 0 {
+                break;
+            }
+
+            new_iteration = mem::replace(iteration, new_iteration);
+        }
+
+        self.last_iter = iter_time;
+    }
+
+    /// Computes the next time the mainloop should be woken to iterate. Returns
+    /// `None` if it could not be comptued.
+    fn compute_next_iteration_instant(&self) -> Option<Instant> {
+        let mut min_duration: Option<Duration> = None;
+
+        for (event1, event2) in self.iter_lengths.iter().tuple_windows() {
+            if event1.1 == 0 || event2.1 == 0 {
+                break;
+            }
+
+            let eff_duration = event1.0.duration_since(event2.0) / event1.1;
+
+            if min_duration.is_none() || eff_duration < min_duration.unwrap() {
+                min_duration = Some(eff_duration);
+            }
+        }
+
+        min_duration.map(|duration| {
+            let final_duration = cmp::min(duration, self.max_interval);
+
+            trace!("Next iteration interval: {}us", final_duration.as_micros());
+
+            self.last_iter.checked_add(final_duration)
+                .expect("Next iteration instant cannot be computed")
+        })
+    }
+
+    /// Waits for the timeout to the next iteration to expire, or for the
+    /// mainloop to receive a shutdown signal. Returns false if a shutdown
+    /// signal was received.
+    async fn await_next_iteration(
+        &self,
+        shutdown_rx: &mut OneshotReceiver<()>
+    ) -> bool {
+        if let Some(instant) = self.compute_next_iteration_instant() {
+            self.await_next_iteration_impl(shutdown_rx, time::sleep_until(instant.into())).await
+        } else {
+            self.await_next_iteration_impl(shutdown_rx, task::yield_now()).await
+        }
+    }
+
+    /// Waits for the future to complete, or for the mainloop to receive a
+    /// shutdown singla. Returns false if a shutdown signal was received.
+    async fn await_next_iteration_impl<F: Future<Output = ()>>(
+        &self,
+        shutdown_rx: &mut OneshotReceiver<()>,
+        next_iter_fut: F
+    ) -> bool {
+        tokio::select! {
+            _ = next_iter_fut => true,
+            _ = shutdown_rx => false,
+        }
+    }
+
+    /// Performs a single iteration of the mainloop.
+    fn iterate(&mut self) -> Result<(), IterateResult> {
+        let iter_time = Instant::now();
+
+        match self.mainloop.iterate(false) {
+            IterateResult::Success(n_evts) => {
+                trace!("Mainloop iteration success, dispatched {} events", n_evts);
+                self.save_processed_events(iter_time, n_evts);
+                Ok(())
+            },
+            e => Err(e),
+        }
+    }
+
+    /// Entry point for executing the mainloop.
+    async fn mainloop(&mut self, mut shutdown_rx: OneshotReceiver<()>) {
         debug!("Mainloop started");
 
-        while util::check_oneshot_rx(&mut rx) {
-            match mainloop.iterate(false) {
-                IterateResult::Success(n_evts) => trace!("Mainloop iteration success, dispatched {} events", n_evts),
-                IterateResult::Quit(_) => {
+        while self.await_next_iteration(&mut shutdown_rx).await {
+            match self.iterate() {
+                Err(IterateResult::Quit(_)) => {
                     warn!("Mainloop quit unexpectedly");
                     break;
                 },
-                IterateResult::Err(e) => {
-                    if let Some(msg) = e.to_string() {
-                        error!("Pulse mainloop encountered error: {}", msg);
-                    } else {
-                        error!("Pulse mainloop encountered unknown error (code {})", e.0);
-                    }
+                Err(IterateResult::Err(e)) => {
+                    error!("Pulse mainloop encountered error: {}", e);
                 },
+                _ => (),
             }
-
-            task::yield_now().await;
         }
 
         debug!("Mainloop exiting");
-    }))
-}
-
-/// Uses the provided `mainloop_tx` handle to signal a shutdown event to the
-/// task spawned by [`start_mainloop`] and waits for it to terminate.
-async fn stop_mainloop(
-    mainloop_tx: OneshotSender<()>,
-    mainloop_handle: JoinHandle<()>
-) {
-    if mainloop_tx.send(()).is_err() {
-        warn!("Failed to terminate mainloop, it may already have exited");
     }
 
-    if !mainloop_handle.is_finished() {
-        if let Err(e) = mainloop_handle.await {
-            if e.is_panic() {
-                warn!("Mainloop task panicked upon shutdown");
+    /// Launches a dedicated task to execute the mainloop.
+    fn start(mut self) -> MainloopHandle {
+        let (tx, rx) = oneshot::channel();
+
+        MainloopHandle(tx, task::spawn_local(async move {
+            self.mainloop(rx).await;
+        }))
+    }
+}
+
+impl MainloopHandle {
+    /// Awaits a potential termination of the mainloop task without consuming
+    /// the handle, to allow cancellations and reuse.
+    async fn await_termination(&mut self) -> Result<(), JoinError> {
+        (&mut self.1).await
+    }
+
+    /// Sends a shutdown signal to the mainloop task and waits for it to
+    /// terminate.
+    async fn stop(self) {
+        if self.0.send(()).is_err() {
+            warn!("Failed to terminated mainloop, it may already have exited");
+        }
+
+        if !self.1.is_finished() {
+            if let Err(e) = self.1.await {
+                if e.is_panic() {
+                    warn!("Mainloop task panicked upon shutdown");
+                }
             }
         }
     }
 }
+
+// HELPER FUNCTIONS ************************************************************
 
 /// Initializes a PulseAudio [`Context`] against the server at the given path
 /// (if present, otherwise autodetects a running server) and starts a task to
@@ -351,8 +499,9 @@ async fn stop_mainloop(
 /// [`InitializingFuture`] that resolves once the context successfully connects
 /// to the server.
 fn pulse_init(
-    server: Option<&str>
-) -> Result<(ValueJoinHandle<OneshotSender<()>>, InitializingFuture<ContextState, Context>), PulseFailure> {
+    server: Option<&str>,
+    max_mainloop_interval_usec: Option<u64>
+) -> Result<(MainloopHandle, InitializingFuture<ContextState, Context>), PulseFailure> {
     let mainloop = Mainloop::new().ok_or(PulseFailure::Error(Code::BadState))?;
     let mut ctx = Context::new(
         &mainloop,
@@ -377,17 +526,29 @@ fn pulse_init(
     let ctx_fut = InitializingFuture::from(ctx);
 
     //Start the mainloop thread and return
-    Ok((start_mainloop(mainloop), ctx_fut))
+    Ok((
+        MainloopHandler::new(
+            mainloop,
+            max_mainloop_interval_usec.map_or(
+                DEFAULT_MAINLOOP_MAX_INTERVAL,
+                |max_interval| Duration::from_micros(max_interval)
+            )
+        ).start(),
+        ctx_fut
+    ))
 }
 
 /// Initializes a PulseAudio [`Context`] and spawns a local task to receive and
 /// execute context operations from the given `op_queue`.
 async fn start_context_handler(
     server: Option<&str>,
-    mut op_queue: Receiver<ContextThunk>
+    max_mainloop_interval_usec: Option<u64>,
+    mut op_queue: MpscReceiver<ContextThunk>
 ) -> Result<JoinHandle<()>, PulseFailure> {
-    let (mainloop_handle, ctx_fut) = pulse_init(server)?;
-    let (mainloop_tx, mut mainloop_handle) = mainloop_handle.into_tuple();
+    let (mut mainloop_handle, ctx_fut) = pulse_init(
+        server,
+        max_mainloop_interval_usec
+    )?;
 
     match ctx_fut.await {
         Ok(mut ctx) => {
@@ -398,7 +559,7 @@ async fn start_context_handler(
                     trace!("Context handler awaiting next job");
                     tokio::select! {
                         biased;
-                        _ = &mut mainloop_handle => panic!("Mainloop terminated unexpectedly"),
+                        _ = mainloop_handle.await_termination() => panic!("Mainloop terminated unexpectedly"),
                         op = op_queue.recv() => if let Some(op) = op {
                             op(&mut ctx);
                         } else {
@@ -410,14 +571,14 @@ async fn start_context_handler(
 
                 debug!("Context handler shutting down");
                 ctx.disconnect();
-                stop_mainloop(mainloop_tx, mainloop_handle).await;
+                mainloop_handle.stop().await;
                 debug!("Context handler shut down");
             }))
         },
         Err(state) => {
             error!("PulseAudio context failed to connect");
 
-            stop_mainloop(mainloop_tx, mainloop_handle).await;
+            mainloop_handle.stop().await;
             Err(match state {
                 ContextState::Failed => PulseFailure::from(Code::Unknown),
                 ContextState::Terminated => PulseFailure::Terminated(1),
