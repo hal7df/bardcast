@@ -38,7 +38,7 @@ use self::event::{
 };
 use self::event::factory::EventListenerFactory;
 use self::owned::{OwnedSinkInfo, OwnedSinkInputInfo};
-use super::{Driver, DriverStartError};
+use super::{Driver, DriverInitError};
 
 pub use self::cfg::PulseDriverConfig;
 
@@ -138,14 +138,11 @@ impl Error for PulseDriverError {
 pub async fn start_driver(
     config: &PulseDriverConfig,
     shutdown_rx: WatchReceiver<bool>
-) -> Result<Driver, DriverStartError> {
+) -> Result<Driver, DriverInitError<PulseDriverError>> {
     let (ctx, ctx_task) = connect(
         config.server.as_deref(),
         config.max_mainloop_interval_usec
-    ).await
-        .map_err(|e| DriverStartError::ConnectionFailure(
-            format!("Failed to connect to PulseAudio ({})", e)
-        ))?.into_tuple();
+    ).await.map_err(|e| DriverInitError::ConnectionError(e.into()))?.into_tuple();
 
     let init_result = initialize(
         ctx,
@@ -165,9 +162,7 @@ pub async fn start_driver(
                 debug!("Context handler tak aborted or panicked upon driver initialization error");
             }
 
-            Err(DriverStartError::InitializationFailure(
-                format!("PulseAudio driver failed to initialize ({})", e)
-            ))
+            Err(DriverInitError::InitializationError(e))
         },
     }
 }

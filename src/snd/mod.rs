@@ -79,11 +79,11 @@ pub struct Driver {
 pub enum DriverStartError {
     /// The sound driver failed to connect to its backend, with any detail
     /// provided as a string.
-    ConnectionFailure(String),
+    ConnectionError(String),
 
     /// The sound driver encountered an internal error while initializing, with
     /// any detail provided as a string.
-    InitializationFailure(String),
+    InitializationError(String),
 
     /// The application failed to automatically find a suitable sound driver.
     NoAvailableBackends,
@@ -91,6 +91,28 @@ pub enum DriverStartError {
     /// The user-requeted sound driver does not exist, with the requested sound
     /// driver provided as a string.
     UnknownDriver(String),
+}
+
+/// Internal specialization of errors thrown specifically by sound drivers
+/// during initialization.
+#[derive(Debug)]
+pub enum DriverInitError<E> {
+    /// The sound driver failed to connect to its backend, with a
+    /// driver-provided error type providing details.
+    ///
+    /// When a driver returns this error during driver autoselection, the
+    /// application will attempt to startthe next configured sound driver, if
+    /// any.
+    ConnectionError(E),
+
+    /// The sound driver encountered an internal error while initializing, but
+    /// was otherwise able to communicate with its backend. A driver-provided
+    /// error type carries the details of the failure.
+    ///
+    /// When a driver returns this error during driver autoselection, the
+    /// application will shut down without attempting to start any other sound
+    /// drivers.
+    InitializationError(E),
 }
 
 // TYPE IMPLS ******************************************************************
@@ -134,12 +156,12 @@ where <R as RbRef>::Rb: AsyncRbRead<u8> {
 impl Display for DriverStartError {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), FormatError> {
         match self {
-            DriverStartError::ConnectionFailure(msg) => write!(
+            DriverStartError::ConnectionError(msg) => write!(
                 f,
                 "Sound driver failed to connect to backend: {}",
                 msg
             ),
-            DriverStartError::InitializationFailure(msg) => write!(
+            DriverStartError::InitializationError(msg) => write!(
                 f,
                 "Sound driver failed to initialize: {}",
                 msg
@@ -157,7 +179,44 @@ impl Display for DriverStartError {
     }
 }
 
+impl<E: Display> Display for DriverInitError<E> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), FormatError> {
+        match self {
+            DriverInitError::ConnectionError(e) => write!(
+                f,
+                "Sound driver failed to connect to backend: {}",
+                e
+            ),
+            DriverInitError::InitializationError(e) => write!(
+                f,
+                "Sound driver failed to initialize: {}",
+                e
+            ),
+        }
+    }
+}
+
 impl Error for DriverStartError {}
+
+impl<E: Error + 'static> Error for DriverInitError<E> {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(match self {
+            DriverInitError::ConnectionError(e) => e,
+            DriverInitError::InitializationError(e) => e,
+        })
+    }
+}
+
+impl<E: ToString> From<DriverInitError<E>> for DriverStartError {
+    fn from(init_error: DriverInitError<E>) -> Self {
+        match init_error {
+            DriverInitError::ConnectionError(e) =>
+                DriverStartError::ConnectionError(e.to_string()),
+            DriverInitError::InitializationError(e) =>
+                DriverStartError::InitializationError(e.to_string()),
+        }
+    }
+}
 
 // PUBLIC INTERFACE FUNCTIONS **************************************************
 
@@ -196,7 +255,10 @@ async fn start_driver(
 ) -> Result<Driver, DriverStartError> {
     let start_result: Result<Driver, DriverStartError> = match driver_name {
         #[cfg(all(target_family = "unix", feature = "pulse"))]
-        pulse::DRIVER_NAME => pulse::start_driver(&config.pulse, shutdown_rx.clone()).await,
+        pulse::DRIVER_NAME => pulse::start_driver(
+            &config.pulse,
+            shutdown_rx.clone()
+        ).await.map_err(|e| e.into()),
         _ => Err(DriverStartError::UnknownDriver(driver_name.to_string())),
     };
 
@@ -220,7 +282,7 @@ async fn autodetect_driver(
     for driver_name in DRIVERS.iter() {
         match start_driver(driver_name, config, shutdown_rx).await {
             Ok(driver) => return Ok(driver),
-            Err(DriverStartError::ConnectionFailure(msg)) => debug!("Driver '{}' failed to connect: {:?}", driver_name, msg),
+            Err(DriverStartError::ConnectionError(msg)) => debug!("Driver '{}' failed to connect: {}", driver_name, msg),
             Err(e) => return Err(e),
         }
     }
