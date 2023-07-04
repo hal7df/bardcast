@@ -24,8 +24,8 @@ use libpulse::context::subscribe::{
     Facility,
     Operation as FacilityOperation
 };
+use libpulse::error::Code;
 
-use super::PulseFailure;
 use super::context::AsyncIntrospector;
 use super::owned::{OwnedSinkInfo, OwnedSinkInputInfo};
 
@@ -48,11 +48,11 @@ pub use self::listen::{
 #[async_trait]
 pub trait EntityInfo: Clone + Send {
     /// Looks up the entity metadata of this type that has the specified index.
-    async fn lookup(introspect: &AsyncIntrospector, idx: u32) -> Result<Self, PulseFailure>;
+    async fn lookup(introspect: &AsyncIntrospector, idx: u32) -> Result<Self, Code>;
 
     /// Looks up all entity metadata of this type currently present in the audio
     /// graph.
-    async fn lookup_all(introspect: &AsyncIntrospector) -> Result<Vec<Self>, PulseFailure>;
+    async fn lookup_all(introspect: &AsyncIntrospector) -> Result<Vec<Self>, Code>;
 
     /// Unwraps an [`AudioEntity`] from the given [`ChangeEntity`] if it wraps
     /// an entity of this type.
@@ -197,11 +197,11 @@ impl From<OwnedSinkInputInfo> for ChangeEntity {
 
 #[async_trait]
 impl EntityInfo for OwnedSinkInfo {
-    async fn lookup(introspect: &AsyncIntrospector, idx: u32) -> Result<Self, PulseFailure> {
+    async fn lookup(introspect: &AsyncIntrospector, idx: u32) -> Result<Self, Code> {
         introspect.get_sink_by_index(idx).await
     }
 
-    async fn lookup_all(introspect: &AsyncIntrospector) -> Result<Vec<Self>, PulseFailure> {
+    async fn lookup_all(introspect: &AsyncIntrospector) -> Result<Vec<Self>, Code> {
         introspect.get_sinks().await
     }
 
@@ -224,11 +224,11 @@ impl EntityInfo for OwnedSinkInfo {
 
 #[async_trait]
 impl EntityInfo for OwnedSinkInputInfo {
-    async fn lookup(introspect: &AsyncIntrospector, idx: u32) -> Result<Self, PulseFailure> {
+    async fn lookup(introspect: &AsyncIntrospector, idx: u32) -> Result<Self, Code> {
         introspect.get_sink_input(idx).await
     }
 
-    async fn lookup_all(introspect: &AsyncIntrospector) -> Result<Vec<Self>, PulseFailure> {
+    async fn lookup_all(introspect: &AsyncIntrospector) -> Result<Vec<Self>, Code> {
         introspect.get_sink_inputs().await
     }
 

@@ -28,7 +28,6 @@ use crate::util::task::AbortingJoinHandle;
 use super::*;
 use super::error::{MissingEventField, ResolveError};
 use super::listen;
-use super::super::PulseFailure;
 use super::super::context::{AsyncIntrospector, PulseContextWrapper};
 use super::super::owned::{OwnedSinkInputInfo, OwnedSinkInfo};
 
@@ -138,7 +137,7 @@ impl InitializedFactoryState {
     async fn listen_for_entity_types(
         &mut self,
         entity_types: InterestMaskSet
-    ) -> Result<(), PulseFailure> {
+    ) -> Result<(), Code> {
         if !self.entity_types.contains(entity_types) {
             self.entity_types |= entity_types;
             subscribe(&self.ctx, self.entity_types).await
@@ -186,7 +185,7 @@ impl EventListenerFactory {
 
     /// Creates an `EventListener` instance that listens for events relating to
     /// the given entity type.
-    pub async fn build<I: EntityInfo>(&mut self) -> Result<OwnedEventListener<I>, PulseFailure> {
+    pub async fn build<I: EntityInfo>(&mut self) -> Result<OwnedEventListener<I>, Code> {
         self.init().await;
 
         if let FactoryState::Initialized(state) = &mut self.0 {
@@ -214,13 +213,13 @@ impl EventListenerFactory {
 
 // TRAIT IMPLS *****************************************************************
 impl TryFrom<&RawChangeEvent> for ChangeEntity {
-    type Error = PulseFailure;
+    type Error = Code;
 
     fn try_from(event: &RawChangeEvent) -> Result<Self, Self::Error> {
         match event.0 {
             Facility::Sink => Ok(Self::Sink(AudioEntity::Index(event.2))),
             Facility::SinkInput => Ok(Self::SinkInput(AudioEntity::Index(event.2))),
-            _ => Err(PulseFailure::from(Code::NotSupported))
+            _ => Err(Code::NotSupported)
         }
     }
 }
@@ -263,17 +262,17 @@ async fn set_subscribe_callback(ctx_wrap: &PulseContextWrapper) -> RawEventConsu
 async fn subscribe(
     ctx_wrap: &PulseContextWrapper,
     entity_types: InterestMaskSet
-) -> Result<(), PulseFailure> {
+) -> Result<(), Code> {
     ctx_wrap.do_ctx_op_default(move |ctx, result| {
         ctx.subscribe(entity_types, move |success| *result.lock().unwrap() = success)
     }).await.map_err(
-        |_| PulseFailure::Error(Code::Killed)
+        |_| Code::Killed
     ).and_then(|subscribe_result| if subscribe_result {
             debug!("Set server entity subscription.");
             Ok(())
     } else {
         error!("Failed to set server entity subscription");
-        Err(PulseFailure::Error(Code::BadState))
+        Err(Code::BadState)
     })
 }
 
@@ -282,7 +281,7 @@ async fn subscribe(
 async fn resolve_entity(
     event: &RawChangeEvent,
     introspect: &AsyncIntrospector,
-) -> Result<ChangeEntity, PulseFailure> {
+) -> Result<ChangeEntity, Code> {
     match event.0 {
         Facility::Sink => Ok(ChangeEntity::Sink(AudioEntity::Info(
             OwnedSinkInfo::lookup(introspect, event.2).await?
@@ -290,7 +289,7 @@ async fn resolve_entity(
         Facility::SinkInput => Ok(ChangeEntity::SinkInput(AudioEntity::Info(
             OwnedSinkInputInfo::lookup(introspect, event.2).await?
         ))),
-        _ => Err(PulseFailure::from(Code::NotSupported)),
+        _ => Err(Code::NotSupported),
     }
 }
 

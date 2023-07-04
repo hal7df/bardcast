@@ -7,10 +7,10 @@ use std::error::Error;
 use std::fmt::{Debug, Display, Error as FormatError, Formatter};
 
 use libpulse::context::subscribe::Facility;
+use libpulse::error::Code;
 
 use tokio::sync::broadcast::error::RecvError;
 
-use super::super::PulseFailure;
 use super::{AudioEntity, ChangeEvent, ChangeEntity, EntityInfo};
 
 // TYPE DEFINITIONS ************************************************************
@@ -32,7 +32,7 @@ pub enum MissingEventField {
 /// [`Self::raw_event`].
 #[derive(Clone, Debug)]
 pub struct LookupError<E> {
-    error: PulseFailure,
+    error: Code,
     raw_event: ChangeEvent<E>,
 }
 
@@ -63,7 +63,7 @@ pub enum EventListenerError<E> {
 //TYPE IMPLS *******************************************************************
 impl<E> LookupError<E> {
     /// Creates a new error instance from the given root cause and raw event.
-    pub fn new(error: PulseFailure, raw_event: ChangeEvent<E>) -> Self {
+    pub fn new(error: Code, raw_event: ChangeEvent<E>) -> Self {
         Self {
             error,
             raw_event,
@@ -120,7 +120,7 @@ impl<E: Display + Debug + 'static> Error for EventListenerError<E> {
 }
 
 //CONVERSIONS ******************************************************************
-impl<E> From<LookupError<E>> for PulseFailure {
+impl<E> From<LookupError<E>> for Code {
     fn from(err: LookupError<E>) -> Self {
         err.error
     }
