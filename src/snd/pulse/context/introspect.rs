@@ -281,7 +281,7 @@ impl AsyncIntrospector {
 
         self.do_op(move |mut introspect, result| introspect.load_module(&name, &args, move |index| {
             collect::last(&result, index);
-        })).await?.ok_or(Code::Unknown)
+        })).await?.ok_or(Code::NoEntity)
     }
 
     /// Unloads the module with the specified index from the server.

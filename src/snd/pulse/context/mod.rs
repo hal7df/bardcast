@@ -191,19 +191,13 @@ impl PulseContextWrapper {
                             break;
                         }
                         if let Err(e) = stream.discard() {
-                            warn!(
-                                "Failure to discard stream sample: {:?}",
-                                Code::try_from(e).unwrap_or(Code::Unknown)
-                            );
+                            warn!("Failure to discard stream sample: {}", e);
                         }
                     },
                     Ok(PeekResult::Hole(hole_size)) => {
                         warn!("PulseAudio stream returned hole of size {} bytes", hole_size);
                         if let Err(e) = stream.discard() {
-                            warn!(
-                                "Failure to discard stream sample: {:?}",
-                                Code::try_from(e).unwrap_or(Code::Unknown)
-                            );
+                            warn!( "Failure to discard stream sample: {}", e);
                         }
                     },
                     Ok(PeekResult::Empty) => {
@@ -254,9 +248,10 @@ impl PulseContextWrapper {
         let stream_fut = rx.await.map_err(|_| Code::NoData)??;
         task::spawn_local(stream_fut).await
             .map_err(|_| Code::Killed)?
-            .map_err(|state| match state {
-                StreamState::Terminated => Code::Killed,
-                _ => Code::BadState,
+            .map_err(|state| if state == StreamState::Terminated {
+                Code::Killed
+            } else {
+                Code::BadState
             })
     }
 
