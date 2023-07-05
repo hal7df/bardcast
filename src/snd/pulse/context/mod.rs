@@ -203,13 +203,10 @@ impl PulseContextWrapper {
                     Ok(PeekResult::Empty) => {
                         trace!("PulseAudio stream had no data");
                     },
-                    Err(e) => {
-                        if let Some(msg) = e.to_string() {
-                            error!("Failed to read audio from PulseAudio: {}", msg);
-                        } else {
-                            error!("Failed to read audio from PulseAudio (code {})", e.0);
-                        }
-                    }
+                    Err(e) => error!(
+                        "Failed to read audio from PulseAudio: {}",
+                        e
+                    ),
                 }
             }
 
