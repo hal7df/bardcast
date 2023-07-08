@@ -17,7 +17,6 @@ use log::{debug, error, warn};
 
 use libpulse::error::Code;
 
-use super::PulseFailure;
 use super::context::AsyncIntrospector;
 use super::owned::OwnedSinkInfo;
 
@@ -35,14 +34,14 @@ const SINK_INPUT_MOVE_FAILURE: &'static str = "Some captured inputs failed to mo
 #[async_trait]
 pub trait Interceptor: Send + Sync {
     /// Intercepts an application with the given sink input ID.
-    async fn intercept(&mut self, sink_input_id: u32) -> Result<(), PulseFailure>;
+    async fn intercept(&mut self, sink_input_id: u32) -> Result<(), Code>;
 
     /// Returns the system name of the audio source that can be used to read
     /// intercepted application audio.
-    fn source_name(&self) -> Result<String, PulseFailure>;
+    fn source_name(&self) -> Result<String, Code>;
 
     /// Returns the number applications that have been intercepted by bardcast.
-    async fn intercepted_stream_count(&self) -> Result<usize, PulseFailure>;
+    async fn intercepted_stream_count(&self) -> Result<usize, Code>;
 
     /// Gracefully closes any system resources that were created by the
     /// `Interceptor`, returning any intercepted streams to another audio device
@@ -76,7 +75,7 @@ impl CapturingInterceptor {
     /// Creates a new `CapturingInterceptor`.
     pub async fn new(
         introspect: &AsyncIntrospector,
-    ) -> Result<Self, PulseFailure> {
+    ) -> Result<Self, Code> {
         let rec_sink = create_rec_sink(introspect).await?;
         debug!("Created rec sink at index {}", rec_sink.index);
 
@@ -93,7 +92,7 @@ impl PeekingInterceptor {
     pub async fn from_sink(
         introspect: &AsyncIntrospector,
         sink: &OwnedSinkInfo,
-    ) -> Result<Self, PulseFailure> {
+    ) -> Result<Self, Code> {
         let rec_sink = create_rec_sink(
             introspect,
         ).await?;
@@ -123,18 +122,18 @@ impl PeekingInterceptor {
 // TRAIT IMPLS *****************************************************************
 #[async_trait]
 impl Interceptor for CapturingInterceptor {
-    async fn intercept(&mut self, sink_input_id: u32) -> Result<(), PulseFailure> {
+    async fn intercept(&mut self, sink_input_id: u32) -> Result<(), Code> {
        self.introspect.move_sink_input_by_index(
            sink_input_id,
            self.rec.index
         ).await
     }
 
-    fn source_name(&self) -> Result<String, PulseFailure> {
-        self.rec.monitor_source_name.clone().ok_or(PulseFailure::from(Code::NoData))
+    fn source_name(&self) -> Result<String, Code> {
+        self.rec.monitor_source_name.clone().ok_or(Code::NoData)
     }
 
-    async fn intercepted_stream_count(&self) -> Result<usize, PulseFailure> {
+    async fn intercepted_stream_count(&self) -> Result<usize, Code> {
        self.introspect.sink_inputs_for_sink(
            self.rec.index
        ).await.map(|inputs| inputs.len())
@@ -170,18 +169,18 @@ impl Interceptor for CapturingInterceptor {
 
 #[async_trait]
 impl Interceptor for PeekingInterceptor {
-    async fn intercept(&mut self, sink_input_id: u32) -> Result<(), PulseFailure> {
+    async fn intercept(&mut self, sink_input_id: u32) -> Result<(), Code> {
         self.introspect.move_sink_input_by_index(
             sink_input_id,
             self.demux.index
         ).await
     }
 
-    fn source_name(&self) -> Result<String, PulseFailure> {
-        self.rec.monitor_source_name.clone().ok_or(PulseFailure::from(Code::NoData))
+    fn source_name(&self) -> Result<String, Code> {
+        self.rec.monitor_source_name.clone().ok_or(Code::NoData)
     }
 
-    async fn intercepted_stream_count(&self) -> Result<usize, PulseFailure> {
+    async fn intercepted_stream_count(&self) -> Result<usize, Code> {
         self.introspect.sink_inputs_for_sink(
             self.demux.index
         ).await.map(|inputs| inputs.len())
@@ -242,9 +241,16 @@ pub async fn boxed_close_interceptor_if_err<I: Interceptor + ?Sized, T, E>(
 async fn get_unique_sink_name(
     introspect: &AsyncIntrospector,
     sink_type: &str
-) -> Result<String, PulseFailure> {
-    let sink_name_template = format!("{}-{}_{}", crate_name!(), process::id(), sink_type);
-    let matching_sink_count = introspect.count_sinks_with_name_prefix(sink_name_template.as_str()).await?;
+) -> Result<String, Code> {
+    let sink_name_template = format!(
+        "{}-{}_{}",
+        crate_name!(),
+        process::id(),
+        sink_type
+    );
+    let matching_sink_count = introspect.count_sinks_with_name_prefix(
+        sink_name_template.as_str()
+    ).await?;
 
     Ok(format!("{}-{}", sink_name_template, matching_sink_count))
 }
@@ -253,7 +259,7 @@ async fn get_unique_sink_name(
 async fn tear_down_virtual_sink_module(
     introspect: &AsyncIntrospector,
     mod_idx: u32
-) -> Result<(), PulseFailure> {
+) -> Result<(), Code> {
     debug!("Tearing down virtual sink owned by module {}", mod_idx);
     introspect.unload_module(mod_idx).await?;
     debug!("Virtual sink torn down");
@@ -267,8 +273,8 @@ async fn tear_down_virtual_sink_module(
 async fn tear_down_module_on_failure<T>(
     introspect: &AsyncIntrospector,
     mod_idx: u32,
-    op_result: Result<T, PulseFailure>
-) -> Result<T, PulseFailure> {
+    op_result: Result<T, Code>
+) -> Result<T, Code> {
     if op_result.is_err() {
         debug!("Tearing down virtual sink module with index {} due to initialization failure", mod_idx);
         tear_down_virtual_sink_module(introspect, mod_idx).await?;
@@ -283,7 +289,7 @@ async fn get_created_virtual_sink<S: ToString>(
     introspect: &AsyncIntrospector,
     sink_name: S,
     mod_idx: u32
-) -> Result<OwnedSinkInfo, PulseFailure> {
+) -> Result<OwnedSinkInfo, Code> {
     let sink_name = sink_name.to_string();
 
     //The PulseAudio server can sometimes change the requested name of the sink
@@ -295,14 +301,14 @@ async fn get_created_virtual_sink<S: ToString>(
         ) && sink.owner_module.as_ref().is_some_and(
             |owner_module| *owner_module == mod_idx
         ))
-        .next().ok_or(PulseFailure::Error(Code::NoEntity))
+        .next().ok_or(Code::NoEntity)
 }
 
 /// Creates a virtual audio sink dedicated for recording audio. No audio sent to
 /// this sink is sent to any other audio devices on the system.
 async fn create_rec_sink(
     introspect: &AsyncIntrospector
-) -> Result<OwnedSinkInfo, PulseFailure> {
+) -> Result<OwnedSinkInfo, Code> {
     let sink_name = get_unique_sink_name(introspect, "rec").await?;
     let args = format!("sink_name={}", sink_name);
 
@@ -323,7 +329,7 @@ async fn create_rec_sink(
 async fn create_demux_sink(
     introspect: &AsyncIntrospector,
     sinks: &[&OwnedSinkInfo]
-) -> Result<OwnedSinkInfo, PulseFailure> {
+) -> Result<OwnedSinkInfo, Code> {
     let sink_name = get_unique_sink_name(introspect, "demux").await?;
     let child_sink_names = sinks.iter()
         .inspect(|sink| if sink.name.is_none() {

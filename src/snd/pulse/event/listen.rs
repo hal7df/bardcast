@@ -1,6 +1,10 @@
 ///! Listener types for consuming audio graph change events from the PulseAudio
 ///! server.
 
+extern crate libpulse_binding as libpulse;
+
+use libpulse::error::Code;
+
 use tokio::sync::broadcast::Receiver;
 use tokio::sync::broadcast::error::RecvError;
 
@@ -60,7 +64,7 @@ impl<I: EntityInfo> OwnedEventListener<I> {
     async fn new(
         introspect: AsyncIntrospector,
         rx: Receiver<Result<ChangeEvent<ChangeEntity>, LookupError<ChangeEntity>>>
-    ) -> Result<Self, PulseFailure> {
+    ) -> Result<Self, Code> {
         Ok(Self {
             existing: I::lookup_all(&introspect).await?,
             rx,
@@ -142,7 +146,7 @@ impl<I: EntityInfo + 'static> ToFilterMapped<I> for OwnedEventListener<I> {
 pub async fn new_listener<I: EntityInfo>(
     introspect: AsyncIntrospector,
     rx: Receiver<Result<ChangeEvent<ChangeEntity>, LookupError<ChangeEntity>>>
-) -> Result<OwnedEventListener<I>, PulseFailure> {
+) -> Result<OwnedEventListener<I>, Code> {
     OwnedEventListener::new(introspect, rx).await
 }
 

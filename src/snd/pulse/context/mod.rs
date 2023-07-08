@@ -48,7 +48,6 @@ use self::async_polyfill::{
     PulseFutureInner,
     StreamReadNotifier
 };
-use super::PulseFailure;
 use crate::util::task::ValueJoinHandle;
 
 // RE-EXPORTS ******************************************************************
@@ -129,7 +128,7 @@ impl PulseContextWrapper {
     pub async fn new(
         server: Option<&str>,
         max_mainloop_interval_usec: Option<u64>
-    ) -> Result<ValueJoinHandle<Self>, PulseFailure> {
+    ) -> Result<ValueJoinHandle<Self>, Code> {
         let (op_queue_tx, op_queue_rx) = mpsc::channel::<ContextThunk>(
             OP_QUEUE_SIZE
         );
@@ -164,7 +163,7 @@ impl PulseContextWrapper {
         &self,
         source_name: impl ToString,
         volume: Option<f64>
-    ) -> Result<ValueJoinHandle<SampleConsumer>, PulseFailure> {
+    ) -> Result<ValueJoinHandle<SampleConsumer>, Code> {
         let mut stream = self.get_connected_stream(source_name.to_string()).await?;
         let (mut sample_tx, sample_rx) = AsyncRb::<u8, HeapRb<u8>>::new(SAMPLE_QUEUE_SIZE).split();
 
@@ -192,31 +191,22 @@ impl PulseContextWrapper {
                             break;
                         }
                         if let Err(e) = stream.discard() {
-                            warn!(
-                                "Failure to discard stream sample: {:?}",
-                                Code::try_from(e).unwrap_or(Code::Unknown)
-                            );
+                            warn!("Failure to discard stream sample: {}", e);
                         }
                     },
                     Ok(PeekResult::Hole(hole_size)) => {
                         warn!("PulseAudio stream returned hole of size {} bytes", hole_size);
                         if let Err(e) = stream.discard() {
-                            warn!(
-                                "Failure to discard stream sample: {:?}",
-                                Code::try_from(e).unwrap_or(Code::Unknown)
-                            );
+                            warn!( "Failure to discard stream sample: {}", e);
                         }
                     },
                     Ok(PeekResult::Empty) => {
                         trace!("PulseAudio stream had no data");
                     },
-                    Err(e) => {
-                        if let Some(msg) = e.to_string() {
-                            error!("Failed to read audio from PulseAudio: {}", msg);
-                        } else {
-                            error!("Failed to read audio from PulseAudio (code {})", e.0);
-                        }
-                    }
+                    Err(e) => error!(
+                        "Failed to read audio from PulseAudio: {}",
+                        e
+                    ),
                 }
             }
 
@@ -241,7 +231,7 @@ impl PulseContextWrapper {
     async fn get_connected_stream(
         &self,
         source_name: String
-    ) -> Result<Stream, PulseFailure> {
+    ) -> Result<Stream, Code> {
         let (tx, rx) = oneshot::channel();
 
         self.with_ctx(move |ctx| {
@@ -252,12 +242,13 @@ impl PulseContextWrapper {
 
         // Note: stream_fut makes PulseAudio API calls directly, so we need
         // to await it in a local task.
-        let stream_fut = rx.await.map_err(|_| PulseFailure::from(Code::BadState))??;
+        let stream_fut = rx.await.map_err(|_| Code::NoData)??;
         task::spawn_local(stream_fut).await
-            .map_err(|_| PulseFailure::from(Code::Unknown))?
-            .map_err(|state| match state {
-                StreamState::Terminated => PulseFailure::Terminated(0),
-                _ => PulseFailure::from(Code::BadState),
+            .map_err(|_| Code::Killed)?
+            .map_err(|state| if state == StreamState::Terminated {
+                Code::Killed
+            } else {
+                Code::BadState
             })
     }
 
@@ -501,12 +492,12 @@ impl MainloopHandle {
 fn pulse_init(
     server: Option<&str>,
     max_mainloop_interval_usec: Option<u64>
-) -> Result<(MainloopHandle, InitializingFuture<ContextState, Context>), PulseFailure> {
-    let mainloop = Mainloop::new().ok_or(PulseFailure::Error(Code::BadState))?;
+) -> Result<(MainloopHandle, InitializingFuture<ContextState, Context>), Code> {
+    let mainloop = Mainloop::new().ok_or(Code::BadState)?;
     let mut ctx = Context::new(
         &mainloop,
         crate_name!(),
-    ).ok_or(PulseFailure::Error(Code::BadState))?;
+    ).ok_or(Code::BadState)?;
 
     //Initiate a connection with a running PulseAudio daemon
     debug!("Connecting to PulseAudio server");
@@ -517,9 +508,7 @@ fn pulse_init(
         server,
         FlagSet::NOAUTOSPAWN,
         None
-    ).map_err(|err| {
-        PulseFailure::Error(Code::try_from(err).unwrap_or(Code::Unknown))
-    })?;
+    ).map_err(|err| Code::try_from(err).unwrap_or(Code::Unknown))?;
 
     //Set up a Future that resolves with the state of the context so
     //dependents can wait until it's ready
@@ -544,7 +533,7 @@ async fn start_context_handler(
     server: Option<&str>,
     max_mainloop_interval_usec: Option<u64>,
     mut op_queue: MpscReceiver<ContextThunk>
-) -> Result<JoinHandle<()>, PulseFailure> {
+) -> Result<JoinHandle<()>, Code> {
     let (mut mainloop_handle, ctx_fut) = pulse_init(
         server,
         max_mainloop_interval_usec
@@ -579,10 +568,10 @@ async fn start_context_handler(
             error!("PulseAudio context failed to connect");
 
             mainloop_handle.stop().await;
-            Err(match state {
-                ContextState::Failed => PulseFailure::from(Code::Unknown),
-                ContextState::Terminated => PulseFailure::Terminated(1),
-                _ => PulseFailure::from(Code::Unknown),
+            Err(if state == ContextState::Terminated {
+                Code::ConnectionTerminated
+            } else {
+                Code::Unknown
             })
         }
     }
@@ -594,14 +583,14 @@ async fn start_context_handler(
 fn create_and_connect_stream(
     ctx: &mut Context,
     source_name: impl AsRef<str>
-) -> Result<InitializingFuture<StreamState, Stream>, PulseFailure> {
+) -> Result<InitializingFuture<StreamState, Stream>, Code> {
     //Technically init_stereo should create a new channel map with the format
     //specifier "front-left,front-right", but due to oddities in the Rust
     //binding for PulseAudio, we have to manually specify the format first. We
     //call init_stereo anyways to make sure we are always using the server's
     //understanding of stereo audio.
     let mut channel_map = ChannelMap::new_from_string("front-left,front-right")
-        .map_err(|_| PulseFailure::from(Code::Invalid))?;
+        .map_err(|_| Code::Invalid)?;
     channel_map.init_stereo();
 
     let mut stream = Stream::new(
@@ -615,7 +604,7 @@ fn create_and_connect_stream(
         Some(source_name.as_ref()),
         None,
         StreamFlagSet::START_UNMUTED
-    )?;
+    ).map_err(|pa_err| Code::try_from(pa_err).unwrap_or(Code::Unknown))?;
 
     Ok(InitializingFuture::from(stream))
 }

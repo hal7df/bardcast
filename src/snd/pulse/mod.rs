@@ -4,6 +4,7 @@ mod intercept;
 mod cfg;
 mod context;
 mod event;
+pub mod error;
 mod owned;
 
 extern crate libpulse_binding as libpulse;
@@ -17,7 +18,7 @@ use regex::Regex;
 use tokio::sync::broadcast::error::RecvError as BroadcastRecvError;
 use tokio::sync::watch::Receiver as WatchReceiver;
 
-use libpulse::error::{Code, PAErr};
+use libpulse::error::Code;
 use libpulse::proplist::Proplist;
 use libpulse::proplist::properties::{
     APPLICATION_NAME,
@@ -37,8 +38,9 @@ use self::event::{
     ToFilterMapped
 };
 use self::event::factory::EventListenerFactory;
+use self::error::{ComponentError, PulseDriverError};
 use self::owned::{OwnedSinkInfo, OwnedSinkInputInfo};
-use super::{Driver, DriverStartError};
+use super::{Driver, DriverInitError};
 
 pub use self::cfg::PulseDriverConfig;
 
@@ -46,27 +48,20 @@ pub const DRIVER_NAME: &'static str = "pulse";
 
 // TYPE DEFINITIONS ************************************************************
 
-/// Error type for differing kinds of failure modes with the PulseAudio API.
-#[derive(Debug, Copy, Clone)]
-pub enum PulseFailure {
-    /// Wrapper around an underlying PulseAudio API error. Also used to indicate
-    /// error conditions within the driver code itself.
-    Error(Code),
-
-    /// Indicates that a PulseAudio connection or entity unexpectedly
-    /// terminated. Provides the terminated entity's exit code.
-    // TODO: This is used in several places that don't provide an exit code, and
-    // a fake value is used instead. This should instead wrap an Option<i32> to
-    // better represent the underlying termination.
-    Terminated(i32),
-}
-
 /// Helper for matching specific properties in a [`Proplist`] against a regular
 /// expression.
 #[derive(Debug, Clone)]
 pub struct ProplistMatcher {
     props: HashSet<String>,
     pattern: Regex,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum DriverComponent {
+    Context,
+    EventHandler,
+    Stream,
+    Interceptor,
 }
 
 // TYPE IMPLS ******************************************************************
@@ -103,34 +98,20 @@ impl ProplistMatcher {
     }
 }
 
+impl DriverComponent {
+    fn to_error(&self, code: Code) -> ComponentError {
+        ComponentError::new(*self, code)
+    }
+}
+
 // TRAIT IMPLS *****************************************************************
-impl From<Code> for PulseFailure {
-    fn from(code: Code) -> Self {
-        PulseFailure::Error(code)
-    }
-}
-
-impl From<PAErr> for PulseFailure {
-    fn from(pa_err: PAErr) -> Self {
-        PulseFailure::from(Code::try_from(pa_err).unwrap_or(Code::Unknown))
-    }
-}
-
-impl Display for PulseFailure {
+impl Display for DriverComponent {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), FormatError> {
         match self {
-            PulseFailure::Error(code) => write!(f, "PulseAudio error: {}", code),
-            PulseFailure::Terminated(code) => write!(f, "PulseAudio connection terminated with status {}", code),
-        }
-    }
-}
-
-impl Error for PulseFailure {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        if let PulseFailure::Error(code) = self {
-            Some(code)
-        } else {
-            None
+            DriverComponent::Context => write!(f, "context"),
+            DriverComponent::EventHandler => write!(f, "event handler"),
+            DriverComponent::Stream => write!(f, "record stream"),
+            DriverComponent::Interceptor => write!(f, "stream interceptor"),
         }
     }
 }
@@ -142,14 +123,13 @@ impl Error for PulseFailure {
 pub async fn start_driver(
     config: &PulseDriverConfig,
     shutdown_rx: WatchReceiver<bool>
-) -> Result<Driver, DriverStartError> {
+) -> Result<Driver, DriverInitError<PulseDriverError>> {
     let (ctx, ctx_task) = connect(
         config.server.as_deref(),
         config.max_mainloop_interval_usec
-    ).await
-        .map_err(|e| DriverStartError::ConnectionFailure(
-            format!("Failed to connect to PulseAudio ({})", e)
-        ))?.into_tuple();
+    ).await.map_err(|e| DriverInitError::ConnectionError(
+        PulseDriverError::from(DriverComponent::Context.to_error(e))
+    ))?.into_tuple();
 
     let init_result = initialize(
         ctx,
@@ -169,9 +149,7 @@ pub async fn start_driver(
                 debug!("Context handler tak aborted or panicked upon driver initialization error");
             }
 
-            Err(DriverStartError::InitializationFailure(
-                format!("PulseAudio driver failed to initialize ({})", e)
-            ))
+            Err(DriverInitError::InitializationError(e))
         },
     }
 }
@@ -180,11 +158,11 @@ pub async fn start_driver(
 
 /// Resolves the metadata for the audio sink targeted by the given
 /// configuration. If a specified sink cannot be found, this returns
-/// `Err(PulseFailure::Error(Code::NoEntity))`.
+/// `Err(Code::NoEntity)`.
 async fn resolve_configured_sink(
     introspect: &AsyncIntrospector,
     config: &PulseDriverConfig
-) -> Result<OwnedSinkInfo, PulseFailure> {
+) -> Result<OwnedSinkInfo, Code> {
     if let Some(sink_index) = config.sink_index {
         introspect.get_sink_by_index(sink_index).await
     } else if let Some(sink_name) = &config.sink_name {
@@ -200,7 +178,7 @@ async fn start_stream_intercept(
     event_rx: OwnedEventListener<OwnedSinkInputInfo>,
     matcher: ProplistMatcher,
     config: &PulseDriverConfig,
-) -> Result<ValueJoinHandle<String>, PulseFailure> {
+) -> Result<ValueJoinHandle<String>, Code> {
     let introspect = AsyncIntrospector::from(ctx);
     let capture_mode = config.intercept_mode.unwrap_or(InterceptMode::Peek);
 
@@ -293,7 +271,7 @@ async fn start_stream_intercept(
 async fn connect(
     server: Option<&str>,
     max_mainloop_interval_usec: Option<u64>
-) -> Result<ValueJoinHandle<PulseContextWrapper>, PulseFailure> {
+) -> Result<ValueJoinHandle<PulseContextWrapper>, Code> {
     let ctx = PulseContextWrapper::new(
         server,
         max_mainloop_interval_usec
@@ -309,7 +287,7 @@ async fn initialize(
     ctx: PulseContextWrapper,
     shutdown_rx: WatchReceiver<bool>,
     config: &PulseDriverConfig
-) -> Result<(SampleConsumer, TaskSetBuilder), PulseFailure> {
+) -> Result<(SampleConsumer, TaskSetBuilder), PulseDriverError> {
     let mut driver_tasks = TaskSetBuilder::new();
 
     // Set up the event listener builder (but do not build it just yet)
@@ -343,19 +321,21 @@ async fn initialize(
             let matcher = ProplistMatcher::new(props, stream_regex.clone());
             driver_tasks.detaching_insert(start_stream_intercept(
                 &ctx,
-                event_builder.build().await?,
+                event_builder.build().await.map_err(|e| DriverComponent::EventHandler.to_error(e))?,
                 matcher,
                 config
-            ).await?)
+            ).await.map_err(|e| DriverComponent::Interceptor.to_error(e))?)
         } else {
-            return Err(PulseFailure::from(Code::BadState));
+            return Err(PulseDriverError::BadConfig(String::from(
+                "`capture' and `peek' intercept modes require -E/--stream-regex"
+            )));
         }
     };
 
     let stream = driver_tasks.detaching_insert(ctx.open_rec_stream(
         rec_name,
         config.volume
-    ).await?);
+    ).await.map_err(|e| DriverComponent::Stream.to_error(e))?);
 
     if let Some(event_task) = event_builder.consume_task() {
         driver_tasks.insert(event_task);
