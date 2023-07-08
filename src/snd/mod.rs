@@ -77,13 +77,13 @@ pub struct Driver {
 /// starting/initializing a sound driver.
 #[derive(Debug)]
 pub enum DriverStartError {
-    /// The sound driver failed to connect to its backend, with any detail
-    /// provided as a string.
-    ConnectionError(String),
+    /// The sound driver failed to connect to its backend. The underlying error
+    /// object is wrapped as a trait object.
+    ConnectionError(Box<dyn Error>),
 
-    /// The sound driver encountered an internal error while initializing, with
-    /// any detail provided as a string.
-    InitializationError(String),
+    /// The sound driver encountered an internal error while initializing. The
+    /// underlying error object is wrapped as a trait object.
+    InitializationError(Box<dyn Error>),
 
     /// The application failed to automatically find a suitable sound driver.
     NoAvailableBackends,
@@ -156,15 +156,15 @@ where <R as RbRef>::Rb: AsyncRbRead<u8> {
 impl Display for DriverStartError {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), FormatError> {
         match self {
-            DriverStartError::ConnectionError(msg) => write!(
+            DriverStartError::ConnectionError(e) => write!(
                 f,
                 "Sound driver failed to connect to backend: {}",
-                msg
+                e
             ),
-            DriverStartError::InitializationError(msg) => write!(
+            DriverStartError::InitializationError(e) => write!(
                 f,
                 "Sound driver failed to initialize: {}",
-                msg
+                e
             ),
             DriverStartError::NoAvailableBackends => write!(
                 f,
@@ -207,13 +207,13 @@ impl<E: Error + 'static> Error for DriverInitError<E> {
     }
 }
 
-impl<E: ToString> From<DriverInitError<E>> for DriverStartError {
+impl<E: Error + 'static> From<DriverInitError<E>> for DriverStartError {
     fn from(init_error: DriverInitError<E>) -> Self {
         match init_error {
             DriverInitError::ConnectionError(e) =>
-                DriverStartError::ConnectionError(e.to_string()),
+                DriverStartError::ConnectionError(Box::new(e)),
             DriverInitError::InitializationError(e) =>
-                DriverStartError::InitializationError(e.to_string()),
+                DriverStartError::InitializationError(Box::new(e)),
         }
     }
 }

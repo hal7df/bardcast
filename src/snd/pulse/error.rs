@@ -76,7 +76,7 @@ impl Error for PulseDriverError {
 
 impl Display for ComponentError {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), FormatError> {
-        write!(f, "Error in pulse driver component '{}': {}", self.0, self.1)
+        write!(f, "Error in driver component '{}': {}", self.0, self.1)
     }
 }
 
