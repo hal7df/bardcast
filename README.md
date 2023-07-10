@@ -1,11 +1,14 @@
 ![bardcast](icon/bardcast-icon-text-192px.png)
 
 bardcast is a commandline application that can read audio playing on your system
-and stream it to a Discord voice chat.
+and stream it to a Discord voice chat. Currently, only Unix-like systems running
+PulseAudio are supported, although support for other OSes and sound servers may
+be added in the future.
 
-bardcast currently only supports Unix-like systems running PulseAudio (and
-possibly PipeWire via its PulseAudio compatibility layer), although support for
-other OSes and sound servers may be added in the future.
+**The PulseAudio driver is not currently compatible with PipeWire's
+compatibility layer. For more information, please see
+[issue #9](https://github.com/hal7df/bardcast/issues/9). Native PipeWire support
+is being tracked in [issue #4](https://github.com/hal7df/bardcast/issues/4).**
 
 # Building
 bardcast needs the following libraries available on your system:
@@ -133,3 +136,4 @@ available on Unix systems when built with the `pulse` feature flag.
 | `sink-name` | String | The name of the audio sink to use with `peek` or `monitor` intercept modes. |
 | `sink-index` | u32 | The index of the audio sink to use with `peek` or `monitor` intercept modes. Overrides `sink-name` if both are set (unless `sink-name` is provided as a command line argument). |
 | `volume` | 0.0 to 1.0 | Normalized volume level for the recording stream. |
+| `max-mainloop-interval-usec` | u64 | The maximum interval between mainloop iterations in microseconds. This can be tweaked if the application is becoming too laggy (decreasing the value) or using too much CPU (increasing the value), but ideally there should be no need to tweak this. Defaults to 20000us (20ms). |
