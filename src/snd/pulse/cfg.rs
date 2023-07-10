@@ -5,7 +5,7 @@ use std::collections::HashSet;
 use configparser::ini::Ini;
 use regex::Regex;
 
-use crate::cfg::{self, Args, InterceptMode, Config};
+use crate::cfg::{self, Action, Args, InterceptMode, Config};
 use crate::snd::pulse;
 
 // TYPE DEFINITIONS ************************************************************
@@ -124,6 +124,18 @@ impl<'a> Config<'a> for PulseDriverConfig {
         if !other.stream_properties.is_empty() {
             self.stream_properties = other.stream_properties;
         }
+    }
+
+    fn validate_semantics(&self, _: Action) -> Result<(), String> {
+        if let Some(intercept_mode) = self.intercept_mode {
+            if intercept_mode != InterceptMode::Monitor && self.stream_regex.is_none() {
+                return Err(String::from(
+                        "The selected intercept mode requires -E/--stream-regex"
+                ));
+            }
+        }
+
+        Ok(())
     }
 }
 
