@@ -145,7 +145,7 @@ pub struct Args {
 ///
 /// In release builds, only the Discord consumer is available. Other audio
 /// consumers are available in debug builds to enable audio driver testing.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum SelectedConsumer {
     Discord,
     #[cfg(debug_assertions)]
@@ -155,7 +155,7 @@ pub enum SelectedConsumer {
 /// Represents the high-level action that the user has requested. Most of these
 /// options correspond to commandline options, except Run(Discord) is assumed
 /// if no overriding option is otherwise passed.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Action {
     Run(SelectedConsumer),
     ListServers,
@@ -164,7 +164,7 @@ pub enum Action {
 }
 
 /// Represents the approach the application uses to intercept system audio.
-#[derive(Copy, Clone, ValueEnum, Debug, PartialEq)]
+#[derive(Clone, Copy, ValueEnum, Debug, PartialEq)]
 pub enum InterceptMode {
     /// Capture system audio, preventing it from reaching a hardware audio
     /// output.
@@ -191,6 +191,18 @@ pub trait Config<'a>: TryFrom<&'a Args> + std::fmt::Debug {
     /// instance, overwriting current values in `self` if corresponding values
     /// are found to be set in `other`.
     fn merge(&mut self, other: Self);
+
+    /// Performs semantic validation of the configuration, i.e.
+    /// misconfigurations that are necessarily correct according to the nature
+    /// of the data structure but are semantically incorrect according to the
+    /// nature of the underlying code. Typically, such configurations arise from
+    /// a combination of configuration parameters, rather than just one.
+    ///
+    /// The action that the application is to run is provided as an argument, as
+    /// that may alter the semantics.
+    ///
+    /// This will only be called after all config merges are complete.
+    fn validate_semantics(&self, action: Action) -> Result<(), String>;
 }
 
 /// Top-level application configuration structure.
@@ -283,6 +295,27 @@ impl ApplicationConfig {
         merge_opt(&mut self.log_level, other.log_level);
         merge_opt(&mut self.driver_name, other.driver_name);
         merge_opt(&mut self.threads, other.threads);
+    }
+
+    /// Performs semantic validation of the configuration, i.e.
+    /// misconfigurations that are necessarily correct according to the nature
+    /// of the data structure but are semantically incorrect according to the
+    /// nature of the underlying code. Typically, such configurations arise from
+    /// a combination of configuration parameters, rather than just one.
+    ///
+    /// The action that the application is to run is provided as an argument, as
+    /// that may alter the semantics.
+    ///
+    /// This will only be called after all config merges are complete.
+    pub fn validate_semantics(&self, action: Action) -> Result<(), String> {
+        if let Action::Run(_) = action {
+            self.pulse.validate_semantics(action)?;
+            self.discord.validate_semantics(action)
+        } else if action == Action::ListServers {
+            self.discord.validate_semantics(action)
+        } else {
+            Ok(())
+        }
     }
 }
 

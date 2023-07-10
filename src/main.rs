@@ -37,7 +37,7 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         },
         Action::ListServers | Action::Run(_) => {
-            let config = match build_config(args) {
+            let config = match build_config(args, action) {
                 Ok(config) => config,
                 Err(s) => {
                     eprintln!("Error in configuration: {}", s);
@@ -67,7 +67,7 @@ fn main() -> ExitCode {
 /// Consumes a [`cfg::Args`] object and converts it into an
 /// [`cfg::ApplicationConfig`] instance, merging configuration from a specified
 /// config file, if present.
-fn build_config(args: Args) -> Result<ApplicationConfig, String> {
+fn build_config(args: Args, action: Action) -> Result<ApplicationConfig, String> {
     let config: Option<ApplicationConfig> = if let Some(configfile) = &args.configfile {
         Some(ApplicationConfig::from_file(configfile)?)
     } else {
@@ -78,8 +78,12 @@ fn build_config(args: Args) -> Result<ApplicationConfig, String> {
 
     if let Some(mut config_from_file) = config {
         config_from_file.merge(config_from_args);
+        config_from_file.validate_semantics(action)?;
+
         Ok(config_from_file)
     } else {
+        config_from_args.validate_semantics(action)?;
+
         Ok(config_from_args)
     }
 }

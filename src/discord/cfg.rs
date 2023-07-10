@@ -2,7 +2,7 @@
 
 use configparser::ini::Ini;
 
-use crate::cfg::{self, Args, Config};
+use crate::cfg::{self, Action, Args, Config, SelectedConsumer};
 
 const SECTION_NAME: &'static str = "discord";
 
@@ -56,5 +56,29 @@ impl<'a> Config<'a> for DiscordConfig {
         cfg::merge_opt(&mut self.voice_channel, other.voice_channel);
         cfg::merge_opt(&mut self.metadata_channel, other.metadata_channel);
         cfg::merge_opt(&mut self.server_id, other.server_id);
+    }
+
+    fn validate_semantics(&self, action: Action) -> Result<(), String> {
+        match action {
+            Action::Run(SelectedConsumer::Discord) => {
+                if self.token.is_none() {
+                    Err(String::from("A Discord bot token is required."))
+                } else if self.server_id.is_none() {
+                    Err(String::from("A Discord server ID is required."))
+                } else if self.voice_channel.is_none() {
+                    Err(String::from("A voice channel name is required."))
+                } else {
+                    Ok(())
+                }
+            },
+            Action::ListServers => {
+                if self.token.is_none() {
+                    Err(String::from("A Discord bot token is required."))
+                } else {
+                    Ok(())
+                }
+            },
+            _ => Ok(())
+        }
     }
 }
