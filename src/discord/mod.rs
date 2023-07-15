@@ -5,10 +5,11 @@ mod client;
 pub mod error;
 
 use std::cmp;
+use std::mem;
 use std::sync::Arc;
 
 use clap::{crate_name, crate_version};
-use futures::future::TryFutureExt;
+use futures::future::{self, Either, FutureExt, TryFutureExt};
 use futures::stream::{self, Stream, TryStreamExt};
 use log::{info, warn};
 use serenity::CacheAndHttp;
@@ -25,6 +26,7 @@ use songbird::input::reader::Reader;
 use songbird::tracks::TrackHandle;
 use stream_flatten_iters::TryStreamExt as _;
 use tokio::sync::Mutex;
+use tokio::sync::oneshot::{self, Sender as OneshotSender};
 use tokio::sync::watch::Receiver as WatchReceiver;
 use tokio::task::JoinHandle;
 
@@ -62,6 +64,10 @@ struct ConnectedClient {
     /// A handle to the event handler task.
     client_task: JoinHandle<Result<(), SerenityError>>,
 
+    /// A channel write handle to communicate exit conditions to the
+    /// `client_task`.
+    client_tx: Option<OneshotSender<()>>,
+
     /// A handle to the active audio connection to Discord.
     call: Arc<Mutex<Call>>,
 
@@ -95,8 +101,22 @@ impl ConnectedClient {
             .remove::<ChannelResolutionReceiver>()
             .ok_or(DiscordError::InitializationError)?;
 
+        let (client_tx, client_rx) = oneshot::channel();
         let client_task = tokio::spawn(async move {
-            client.start().await
+            let shutdown_res = if let Either::Right((Err(e), _)) = future::select(
+                client_rx,
+                client.start().boxed()
+            ).await {
+                Err(e)
+            } else {
+                Ok(())
+            };
+
+            //Regardless of the result, we're shutting down, so terminate the
+            //connection with Discord
+            client.shard_manager.lock().await.shutdown_all().await;
+
+            shutdown_res
         });
 
         let channels = match channel_rx.await {
@@ -123,6 +143,7 @@ impl ConnectedClient {
         Ok(Self {
             channels,
             client_task,
+            client_tx: Some(client_tx),
             call,
             cache_http
         })
@@ -219,7 +240,7 @@ impl ConnectedClient {
 
     /// Terminates any playing audio and posts a disconnect message to the
     /// configured metadata channel (if any).
-    async fn cleanup(&self, track: TrackHandle) {
+    async fn cleanup(&mut self, track: TrackHandle) {
         //Stop playing audio and disconnect from the voice chat
         if let Err(e) = track.stop() {
             warn!("Failed to gracefully stop audio playback: {}", e);
@@ -236,6 +257,25 @@ impl ConnectedClient {
                 format!("{} disconnected", crate_name!())
             ).await {
                 warn!("failed to post disconnect message to Discord: {}", e);
+            }
+        }
+
+        //Shut down the client handler thread, if it is still running
+        if let Some(client_tx) = mem::take(&mut self.client_tx) {
+            if !self.client_task.is_finished() {
+                if client_tx.send(()).is_err() {
+                    warn!("Client task dropped shutdown channel but is still running");
+                } else {
+                    match (&mut self.client_task).await {
+                        Err(e) => if e.is_panic() {
+                            warn!("Client task panicked during shutdown");
+                        },
+                        Ok(Err(e)) => {
+                            warn!("Client task terminated with error: {}", e);
+                        },
+                        _ => {},
+                    }
+                }
             }
         }
     }
