@@ -211,6 +211,7 @@ impl PulseContextWrapper {
             }
 
             debug!("Stream handler shutting down");
+            notify.close(&mut stream);
 
             //Tear down the record stream
             if let Err(e) = stream.disconnect() {
