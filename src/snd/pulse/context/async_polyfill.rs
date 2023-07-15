@@ -120,6 +120,17 @@ impl<S: Unpin, T: InitializingEntity<S> + Unpin> Future for InitializingFuture<S
     }
 }
 
+impl<S, T: InitializingEntity<S>> Drop for InitializingFuture<S, T> {
+    fn drop(&mut self) {
+        if let Some(entity) = &mut self.0 {
+            //In case the future is cancelled, clear out the Waker to prevent
+            //the stream read callback from potentially accidentally waking a
+            //nonexistent task
+            entity.wake_on_state_change(None)
+        }
+    }
+}
+
 impl InitializingEntity<PulseContextState> for PulseContext {
     fn get_initialization_state(&self) -> InitializingState<PulseContextState> {
         match self.get_state() {
