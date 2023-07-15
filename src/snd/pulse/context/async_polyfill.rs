@@ -179,6 +179,18 @@ impl StreamReadNotifier {
     pub fn await_data<'a>(&'a self) -> StreamReadFuture<'a> {
         StreamReadFuture::new(&self.0)
     }
+
+    /// Closes the notifier, and unsets the read callback on the stream. This
+    /// should be done instead of letting the notifier go out of scope
+    /// implicitly, as leaving the read callback set can lead to intermittent
+    /// segfaults.
+    ///
+    /// This is done as a dedicated function to avoid holding a mutable
+    /// reference to the stream during the notifier's lifetime when it is not
+    /// needed, which would also prevent reading data from the stream.
+    pub fn close(self, stream: &mut PulseStream) {
+        stream.set_read_callback(None);
+    }
 }
 
 //IMPL: StreamReadFuture *******************************************************
@@ -206,6 +218,15 @@ impl<'a> Future for StreamReadFuture<'a> {
             self.has_polled = true;
             Poll::Pending
         }
+    }
+}
+
+impl<'a> Drop for StreamReadFuture<'a> {
+    fn drop(&mut self) {
+        //In case the future is cancelled, clear out the Waker to prevent the
+        //stream read callback from potentially accidentally waking a
+        //nonexistent task
+        *self.waker.lock().unwrap() = None;
     }
 }
 
@@ -313,5 +334,14 @@ impl<T: Default> Future for PulseFuture<T> {
             State::Cancelled => Poll::Ready(Err(inner.state)),
             State::Done => Poll::Ready(Ok(mem::take(&mut inner.result))),
         }
+    }
+}
+
+impl<T> Drop for PulseFuture<T> {
+    fn drop(&mut self) {
+        //In case the future is cancelled, clear out the Waker to prevent the
+        //stream read callback from potentially accidentally waking a
+        //nonexistent task
+        self.0.lock().unwrap().waker = None
     }
 }
