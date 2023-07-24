@@ -29,6 +29,7 @@ use super::*;
 use super::error::{MissingEventField, ResolveError};
 use super::listen;
 use super::super::context::{AsyncIntrospector, PulseContextWrapper};
+use super::super::context::collect::CollectResult;
 use super::super::owned::{OwnedSinkInputInfo, OwnedSinkInfo};
 
 /// The maximum length of the event notification queue, for both the internal
@@ -264,7 +265,7 @@ async fn subscribe(
     entity_types: InterestMaskSet
 ) -> Result<(), Code> {
     ctx_wrap.do_ctx_op_default(move |ctx, result| {
-        ctx.subscribe(entity_types, move |success| *result.lock().unwrap() = success)
+        ctx.subscribe(entity_types, move |success| result.store(success))
     }).await.map_err(
         |_| Code::Killed
     ).and_then(|subscribe_result| if subscribe_result {
