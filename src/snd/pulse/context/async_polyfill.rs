@@ -6,7 +6,6 @@ extern crate libpulse_binding as libpulse;
 use std::future::Future;
 use std::marker::{PhantomData, Unpin};
 use std::mem;
-
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
