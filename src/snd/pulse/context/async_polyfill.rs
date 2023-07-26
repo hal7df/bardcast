@@ -6,14 +6,12 @@ extern crate libpulse_binding as libpulse;
 use std::future::Future;
 use std::marker::{PhantomData, Unpin};
 use std::mem;
-use std::ops::{Deref, DerefMut, FnOnce};
 use std::pin::Pin;
-use std::sync::{Arc, LockResult, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 
 use libpulse::context::{Context as PulseContext, State as PulseContextState};
 use libpulse::stream::{Stream as PulseStream, State as PulseStreamState};
-use libpulse::operation::{Operation, State};
 
 //TYPE DEFINITIONS *************************************************************
 
@@ -68,24 +66,6 @@ pub struct StreamReadFuture<'a> {
     waker: &'a Arc<Mutex<Option<Waker>>>,
     has_polled: bool,
 }
-
-/// Inner state for [`PulseFuture`].
-pub struct PulseFutureInner<T> {
-    state: State,
-    waker: Option<Waker>,
-    result: T,
-}
-
-/// A wrapper for a [`PulseFuture`]'s internal state that exposes just the
-/// future's pending result.
-pub struct PulseResultRef<T>(Arc<Mutex<PulseFutureInner<T>>>);
-
-/// Lock guard for [`PulseResultRef`].
-pub struct PulseResultGuard<'a, T>(MutexGuard<'a, PulseFutureInner<T>>);
-
-/// Generic future implementation for asynchronous operations executing in the
-/// libpulse mainloop abstraction.
-pub struct PulseFuture<T>(Arc<Mutex<PulseFutureInner<T>>>);
 
 //IMPL: InitializingFuture *****************************************************
 impl<S: Unpin, T: InitializingEntity<S> + Unpin> From<T> for InitializingFuture<S, T> {
@@ -238,121 +218,5 @@ impl<'a> Drop for StreamReadFuture<'a> {
         //stream read callback from potentially accidentally waking a
         //nonexistent task
         *self.waker.lock().unwrap() = None;
-    }
-}
-
-//IMPL: PulseFuture ************************************************************
-impl<T> PulseFutureInner<T> {
-    /// Creates a new shared state object seeded with the given initial value.
-    pub fn from(initial: T) -> Arc<Mutex<Self>> {
-        Arc::new(Mutex::new(Self {
-            state: State::Running,
-            waker: None,
-            result: initial,
-        }))
-    }
-
-    /// Calls the given operation with a reference to the pending future result
-    /// that does not expose other state values.
-    pub fn apply<S: ?Sized, F>(
-        this: &Arc<Mutex<Self>>,
-        ctx: &mut PulseContext,
-        op: F
-    ) -> Operation<S>
-    where F: FnOnce(&mut PulseContext, PulseResultRef<T>) -> Operation<S> {
-        op(ctx, PulseResultRef::from(this))
-    }
-
-    /// Determines if the operation associated with this future has terminated.
-    pub fn terminated(&self) -> bool {
-        self.state != State::Running
-    }
-
-    /// Updates the cached operation execution state.
-    pub fn set_state(&mut self, state: State) {
-        self.state = state;
-    }
-
-    /// Wakes the associated future, if it has caused a task to go to sleep.
-    pub fn wake(&self) {
-        if let Some(waker) = &self.waker {
-            waker.wake_by_ref();
-        }
-    }
-}
-
-impl<T: Default> PulseFutureInner<T> {
-    /// Creates a new shared state object seeded with the underlying type's
-    /// `Default` value.
-    pub fn new() -> Arc<Mutex<Self>> {
-        Self::from(T::default())
-    }
-}
-
-impl<T> From<&Arc<Mutex<PulseFutureInner<T>>>> for PulseResultRef<T> {
-    fn from(inner: &Arc<Mutex<PulseFutureInner<T>>>) -> Self {
-        Self(Arc::clone(inner))
-    }
-}
-
-impl<T> PulseResultRef<T> {
-    /// Locks the underlying state object, and returns a guard object that
-    /// unlocks the state object when it is dropped.
-    pub fn lock<'a>(&'a self) -> LockResult<PulseResultGuard<'a, T>> {
-        self.0.lock()
-            .map(|guard| PulseResultGuard::from(guard))
-            .map_err(|poison| PoisonError::new(PulseResultGuard::from(poison.into_inner())))
-    }
-}
-
-impl<'a, T> From<MutexGuard<'a, PulseFutureInner<T>>> for PulseResultGuard<'a, T> {
-    fn from(inner: MutexGuard<'a, PulseFutureInner<T>>) -> Self {
-        Self(inner)
-    }
-}
-
-impl<T> Deref for PulseResultGuard<'_, T> {
-    type Target = T;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0.result
-    }
-}
-
-impl<T> DerefMut for PulseResultGuard<'_, T> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0.result
-    }
-}
-
-impl<T> From<&Arc<Mutex<PulseFutureInner<T>>>> for PulseFuture<T> {
-    fn from(op: &Arc<Mutex<PulseFutureInner<T>>>) -> Self {
-        Self(Arc::clone(op))
-    }
-}
-
-impl<T: Default> Future for PulseFuture<T> {
-    type Output = Result<T, State>;
-
-    fn poll(self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<Self::Output> {
-        let mut inner = self.0.lock().unwrap();
-
-        match inner.state {
-            State::Running => {
-                inner.waker = Some(ctx.waker().clone());
-                Poll::Pending
-            },
-            State::Cancelled => Poll::Ready(Err(inner.state)),
-            State::Done => Poll::Ready(Ok(mem::take(&mut inner.result))),
-        }
-    }
-}
-
-impl<T> Drop for PulseFuture<T> {
-    fn drop(&mut self) {
-        //In case the future is cancelled, clear out the Waker to prevent the
-        //stream read callback from potentially accidentally waking a
-        //nonexistent task
-        self.0.lock().unwrap().waker = None
     }
 }

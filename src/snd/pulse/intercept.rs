@@ -144,7 +144,11 @@ impl Interceptor for CapturingInterceptor {
             let default_sink = self.introspect.get_default_sink().await.map(|sink| sink.index);
 
             if let Ok(default_sink) = default_sink {
-                if !move_sink_inputs_to_sink(&self.introspect, inputs.iter(), default_sink).await {
+                if !move_sink_inputs_to_sink(
+                    &self.introspect,
+                    inputs.iter().map(|input| input.index),
+                    default_sink
+                ).await {
                     warn!("{} {}", SINK_INPUT_MOVE_FAILURE, TEARDOWN_FAILURE_WARNING);
                 }
             } else {
@@ -188,7 +192,11 @@ impl Interceptor for PeekingInterceptor {
 
     async fn close(mut self) {
         if let Ok(inputs) = self.introspect.sink_inputs_for_sink(self.demux.index).await {
-            if !move_sink_inputs_to_sink(&self.introspect, inputs.iter(), self.orig_idx).await {
+            if !move_sink_inputs_to_sink(
+                &self.introspect,
+                inputs.iter().map(|input| input.index),
+                self.orig_idx
+            ).await {
                 warn!("{} {}", SINK_INPUT_MOVE_FAILURE, TEARDOWN_FAILURE_WARNING);
             }
         } else {
@@ -382,19 +390,19 @@ async fn tear_down_virtual_sink(
 }
 
 /// Bulk moves all of the sink inputs in `sink_inputs` to the given sink.
-async fn move_sink_inputs_to_sink<'a, I>(
+async fn move_sink_inputs_to_sink<I>(
     introspect: &AsyncIntrospector,
     sink_inputs: I,
     target_sink_idx: u32
 ) -> bool
-where I: Iterator<Item = &'a u32> {
+where I: Iterator<Item = u32> {
     future::join_all(sink_inputs.map(|input| {
         debug!(
             "Moving captured input with index {} to sink with index {}",
-            *input,
+            input,
             target_sink_idx
         );
-        introspect.move_sink_input_by_index(*input, target_sink_idx)
+        introspect.move_sink_input_by_index(input, target_sink_idx)
     })).await.iter().map(|res| res.is_ok()).fold(true, |acc, x| acc && x)
 }
 

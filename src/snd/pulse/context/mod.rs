@@ -9,7 +9,7 @@ extern crate libpulse_binding as libpulse;
 use std::cmp;
 use std::future::Future;
 use std::mem;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use async_ringbuf::{AsyncConsumer, AsyncProducer, AsyncRb};
@@ -45,17 +45,13 @@ use libpulse::stream::{
 
 use self::async_polyfill::{
     InitializingFuture,
-    PulseFutureInner,
     StreamReadNotifier
 };
+use crate::util;
 use crate::util::task::ValueJoinHandle;
 
 // RE-EXPORTS ******************************************************************
 pub use self::introspect::AsyncIntrospector;
-pub use async_polyfill::{
-    PulseFuture,
-    PulseResultRef
-};
 
 // MODULE-INTERNAL CONSTANTS ***************************************************
 
@@ -257,38 +253,77 @@ impl PulseContextWrapper {
     /// functions.
     async fn do_ctx_op_impl<T, S, F>(
         &self,
-        fut_inner: Arc<Mutex<PulseFutureInner<T>>>,
+        initial_value: T,
         op: F
     ) -> Result<T, OperationState>
     where
-        T: Default + Send + 'static,
+        T: Send + 'static,
         S: ?Sized + 'static,
-        F: FnOnce(&mut Context, PulseResultRef<T>) -> Operation<S> + Send + 'static {
-        let fut = PulseFuture::from(&fut_inner);
+        F: FnOnce(&mut Context, Weak<Mutex<T>>) -> Operation<S> + Send + 'static {
+        let (tx, rx) = oneshot::channel::<Result<T, OperationState>>();
 
         self.with_ctx(move |ctx| {
-            let op = Arc::new(Mutex::new(Some(PulseFutureInner::apply(&fut_inner, ctx, op))));
+            let value = Arc::new(Mutex::new(initial_value));
+            let op = Arc::new(Mutex::new(Some(op(ctx, Arc::downgrade(&value)))));
+
             let mut op_ref = Arc::clone(&op);
+            let mut tx = Some(tx);
+            let mut result = Some(value);
 
             op.lock().unwrap().as_mut().unwrap().set_state_callback(Some(Box::new(move || {
-                let mut fut_inner = fut_inner.lock().unwrap();
+                let state = op_ref.lock().unwrap().as_ref().map(
+                    Operation::get_state
+                );
 
-                fut_inner.set_state(if let Some(op) = &*op_ref.lock().unwrap() {
-                    op.get_state()
-                } else {
-                    warn!("Operation object dropped during state callback execution");
-                    OperationState::Cancelled
-                });
-                fut_inner.wake();
+                match state {
+                    Some(OperationState::Done) => {
+                        // There should never be any other strong references to
+                        // the value when this runs, so just try to unwrap it 
+                        if let Some(result) = mem::take(&mut result).map(Arc::into_inner).flatten() {
+                            let result = result.into_inner().unwrap();
 
-                //If the operation completed, drop the self reference
-                if fut_inner.terminated() {
+                            if util::opt_oneshot_try_send(&mut tx, Ok(result)).is_err() {
+                                warn!("Failed to report operation result, receiver dropped");
+                            }
+                        } else {
+                            warn!("Could not acquire context result");
+                            
+                            if util::opt_oneshot_try_send(
+                                &mut tx,
+                                Err(OperationState::Done)
+                            ).is_err() {
+                                warn!("Failed to report operation result, receiver dropped");
+                            }
+                        }
+                    },
+                    Some(OperationState::Cancelled) | None => {
+                        if state.is_none() {
+                            warn!("Operation handle dropped during callback execution");
+                        }
+
+                        if util::opt_oneshot_try_send(
+                            &mut tx,
+                            Err(OperationState::Cancelled)
+                        ).is_err() {
+                            warn!("Failed to report operation result, receiver dropped");
+                        }
+                    }
+                    Some(state) => debug!(
+                        "Context handler ignoring state change to {:?}",
+                        state
+                    ),
+                }
+
+                if tx.is_none() {
                     mem::drop(mem::take(&mut op_ref));
                 }
             })));
         }).await;
 
-        fut.await
+        //this returns Result<Result<T, OperationState>, RecvError>. If the
+        //outer Result returns an Err, then the sender was dropped before it
+        //sent any value, so we treat this as a cancelled state.
+        rx.await.map_err(|_| OperationState::Cancelled)?
     }
 
     /// Executes the given function `op`, and waits for the returned
@@ -298,8 +333,8 @@ impl PulseContextWrapper {
     where
         T: Default + Send + 'static,
         S: ?Sized + 'static,
-        F: FnOnce(&mut Context, PulseResultRef<T>) -> Operation<S> + Send + 'static {
-        self.do_ctx_op_impl(PulseFutureInner::new(), op).await
+        F: FnOnce(&mut Context, Weak<Mutex<T>>) -> Operation<S> + Send + 'static {
+        self.do_ctx_op_impl(T::default(), op).await
     }
 
     /// Executes the given function `op`, and waits for the returned
@@ -309,7 +344,7 @@ impl PulseContextWrapper {
     where
         T: Send + 'static,
         S: ?Sized + 'static,
-        F: FnOnce(&mut Context, PulseResultRef<Option<T>>) -> Operation<S> + Send + 'static {
+        F: FnOnce(&mut Context, Weak<Mutex<Option<T>>>) -> Operation<S> + Send + 'static {
         self.do_ctx_op_default(op).await
     }
 
@@ -322,7 +357,7 @@ impl PulseContextWrapper {
     where 
         T: Send + 'static,
         S: ?Sized + 'static,
-        F: FnOnce(&mut Context, PulseResultRef<Vec<T>>) -> Operation<S> + Send + 'static {
+        F: FnOnce(&mut Context, Weak<Mutex<Vec<T>>>) -> Operation<S> + Send + 'static {
         self.do_ctx_op_default(op).await
     }
 }
