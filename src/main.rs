@@ -1,6 +1,5 @@
 mod cfg;
-mod discord;
-mod sample_log;
+mod consumer;
 mod snd;
 mod util;
 
@@ -15,11 +14,15 @@ use time::UtcOffset;
 use tokio::runtime::Builder as TokioRuntimeBuilder;
 use tokio::signal;
 use tokio::sync::watch::{self, Sender};
-use tokio::task::{JoinError, JoinSet, LocalSet};
+use tokio::task::{JoinError, LocalSet};
 
 use self::cfg::{Action, Args, ApplicationConfig, SelectedConsumer};
+use self::consumer::discord;
 use self::util::fmt as fmt_util;
 use self::util::task::{TaskContainer, TaskSetBuilder};
+
+#[cfg(feature = "wav")]
+use self::consumer::wav;
 
 const DEFAULT_WORKER_THREADS: usize = 2;
 
@@ -214,17 +217,26 @@ fn start(
                             Err(e) => Err(e.to_string()),
                         }
                     },
-                    #[cfg(debug_assertions)]
-                    SelectedConsumer::PrintSampleStats => {
-                        let stream = stream.into_async_read();
-                        let mut stream_tasks = JoinSet::new();
+                    #[cfg(feature = "wav")]
+                    SelectedConsumer::Wav => {
+                        if let Some(output_file) = &config.output_file {
+                            let mut tasks = TaskSetBuilder::new();
+                            let record_result = wav::record(
+                                output_file,
+                                stream.into_media_source(),
+                                shutdown_rx
+                            );
 
-                        stream_tasks.spawn(sample_log::log_sample_stats(
-                            stream,
-                            shutdown_rx
-                        ));
-
-                        Ok(Box::new(stream_tasks))
+                            match record_result {
+                                Ok(task) => {
+                                    tasks.insert(task);
+                                    Ok(Box::new(tasks.build()))
+                                },
+                                Err(e) => Err(e.to_string()),
+                            }
+                        } else {
+                            Err(String::from("Wav consumer requires -o/--output-file"))
+                        }
                     },
                 };
 

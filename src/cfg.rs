@@ -7,10 +7,10 @@ use std::path::Path;
 
 use clap::{crate_name, Parser, ValueEnum};
 use configparser::ini::Ini;
-use log::LevelFilter;
+use log::{LevelFilter, warn};
 use regex::{Error as RegexError, Regex};
 
-use crate::discord::cfg::DiscordConfig;
+use crate::consumer::discord::cfg::DiscordConfig;
 
 #[cfg(all(target_family = "unix", feature = "pulse"))]
 use crate::snd::pulse::PulseDriverConfig;
@@ -74,14 +74,6 @@ pub struct Args {
     #[clap(short, long)]
     pub token: Option<String>,
 
-    /// The unique ID of the Discord server to connect to.
-    ///
-    /// This server must be accessible by the provided token. In order to
-    /// determine the IDs of servers accessible by a given token, run bardcast
-    /// with a valid token and the --list-servers option.
-    #[clap(short, long)]
-    pub server_id: Option<u64>,
-
     /// The name of the Discord voice channel to which bardcast should connect.
     #[clap(long)]
     pub voice_channel: Option<String>,
@@ -93,10 +85,19 @@ pub struct Args {
     #[clap(long)]
     pub metadata_channel: Option<String>,
 
-    /// Number of worker threads to spawn, not including the main thread.
-    /// Defaults to 2.
-    #[clap(short = 'j', long)]
-    pub threads: Option<usize>,
+    /// Path to a file to which to write recorded audio. Only works with audio
+    /// consumers that write to file (e.g. "wav").
+    #[cfg(feature = "wav")]
+    #[clap(short, long)]
+    pub output_file: Option<String>,
+
+    /// The unique ID of the Discord server to connect to.
+    ///
+    /// This server must be accessible by the provided token. In order to
+    /// determine the IDs of servers accessible by a given token, run bardcast
+    /// with a valid token and the --list-servers option.
+    #[clap(short, long)]
+    pub server_id: Option<u64>,
 
     /// Volume of the audio sent to Discord, represented as a decimal from 0 to
     /// 1.
@@ -108,6 +109,11 @@ pub struct Args {
     #[clap(short, long)]
     pub volume: Option<f64>,
 
+    /// Number of worker threads to spawn, not including the main thread.
+    /// Defaults to 2.
+    #[clap(short = 'j', long)]
+    pub threads: Option<usize>,
+
     /// Application verbosity level. One of "off", "error", "warn", "info",
     /// "debug", or "trace". If not specified, this will default to "info".
     #[clap(long)]
@@ -117,6 +123,14 @@ pub struct Args {
     /// Some drivers may not support all options.
     #[clap(short = 'm', long, value_enum)]
     pub intercept_mode: Option<InterceptMode>,
+
+    /// Selects the audio consumer to use when running the application. The
+    /// available consumers depend on what features were enabled when bardcast
+    /// was built.
+    ///
+    /// Defaults to the "discord" consumer.
+    #[clap(long, value_enum, default_value = "discord")]
+    pub consumer: SelectedConsumer,
 
     /// Print the supported sound drivers and exit.
     #[clap(long, action)]
@@ -130,26 +144,14 @@ pub struct Args {
     /// Print application version information and exit.
     #[clap(long, action)]
     pub version: bool,
-
-    /// Instead of sending audio to Discord, compute and print statistics of
-    /// audio samples collected from the sound driver. This is useful to
-    /// validate that the driver is receiving audio correctly.
-    ///
-    /// This feature is not available in release builds.
-    #[cfg(debug_assertions)]
-    #[clap(long, action)]
-    pub print_sample_stats: bool,
 }
 
 /// Represents the audio consumer to be used for a run of the application.
-///
-/// In release builds, only the Discord consumer is available. Other audio
-/// consumers are available in debug builds to enable audio driver testing.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, ValueEnum, Debug, PartialEq)]
 pub enum SelectedConsumer {
     Discord,
-    #[cfg(debug_assertions)]
-    PrintSampleStats,
+    #[cfg(feature = "wav")]
+    Wav,
 }
 
 /// Represents the high-level action that the user has requested. Most of these
@@ -225,6 +227,11 @@ pub struct ApplicationConfig {
     /// The name of the sound driver to use.
     pub driver_name: Option<String>,
 
+    /// A path to the output file to which to write, if using a consumer that
+    /// writes to file.
+    #[cfg(feature = "wav")]
+    pub output_file: Option<String>,
+
     /// The number of threads to use in the application runtime.
     pub threads: Option<usize>,
 }
@@ -243,12 +250,7 @@ impl From<&Args> for Action {
             return Action::ListServers;
         }
 
-        #[cfg(debug_assertions)]
-        if args.print_sample_stats {
-            return Action::Run(SelectedConsumer::PrintSampleStats);
-        }
-
-        Action::Run(SelectedConsumer::Discord)
+        Action::Run(args.consumer)
     }
 }
 
@@ -262,8 +264,20 @@ impl TryFrom<Args> for ApplicationConfig {
             discord: DiscordConfig::try_from(&args)?,
             log_level: args.log_level,
             driver_name: args.driver_name,
+            #[cfg(feature = "wav")]
+            output_file: args.output_file,
             threads: args.threads,
         })
+    }
+}
+
+impl SelectedConsumer {
+    fn needs_output_file(&self) -> bool {
+        match self {
+            SelectedConsumer::Discord => false,
+            #[cfg(feature = "wav")]
+            SelectedConsumer::Wav => true,
+        }
     }
 }
 
@@ -281,6 +295,8 @@ impl ApplicationConfig {
             discord: DiscordConfig::from_ini(&config)?,
             log_level: validate_log_level(&config.get(crate_name!(), "log-level"))?,
             driver_name: config.get(crate_name!(), "driver"),
+            #[cfg(feature = "wav")]
+            output_file: config.get("wav", "output-file"),
             threads: validate_thread_count(&config.getuint(crate_name!(), "threads")?)?,
         })
     }
@@ -294,6 +310,8 @@ impl ApplicationConfig {
 
         merge_opt(&mut self.log_level, other.log_level);
         merge_opt(&mut self.driver_name, other.driver_name);
+        #[cfg(feature = "wav")]
+        merge_opt(&mut self.output_file, other.output_file);
         merge_opt(&mut self.threads, other.threads);
     }
 
@@ -308,7 +326,13 @@ impl ApplicationConfig {
     ///
     /// This will only be called after all config merges are complete.
     pub fn validate_semantics(&self, action: Action) -> Result<(), String> {
-        if let Action::Run(_) = action {
+        if let Action::Run(consumer) = action {
+            if self.output_file.is_some() && !consumer.needs_output_file() {
+                warn!("-o/--output-file does not make sense with the selected audio consumer, ignoring");
+            } else if self.output_file.is_none() && consumer.needs_output_file() {
+                return Err(String::from("Selected audio consumer requires an output file to be specified"));
+            }
+
             self.pulse.validate_semantics(action)?;
             self.discord.validate_semantics(action)
         } else if action == Action::ListServers {

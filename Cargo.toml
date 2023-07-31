@@ -9,8 +9,9 @@ rust-version = "1.70.0"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [features]
-default = ["pulse"]
+default = ["pulse", "wav"]
 pulse = ["dep:libpulse-binding", "dep:itertools"]
+wav = ["dep:wave_stream"]
 
 [dependencies]
 async-ringbuf = "0.1.2"
@@ -30,6 +31,7 @@ songbird = { version = "0.3.2", features = ["serenity-rustls"] }
 stream-flatten-iters = "0.2.0"
 time = { version = "0.3.17", features = ["local-offset"] }
 tokio = { version = "~1.28", features = ["full"] }
+wave_stream = { version = "0.3.0", optional = true }
 
 [dependencies.serenity]
 version = "0.11.5"
