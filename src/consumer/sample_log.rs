@@ -18,20 +18,20 @@ use crate::util;
 const SAMPLE_BUF_SIZE: usize = 24000;
 
 /// Computes the minimum, average, and maximum values for the given slice of
-/// `i16`s, returning a tuple containing the statistics in that order.
-fn compute_stats(samples: &[i16]) -> (i16, i64, i16) {
+/// `f32`s, returning a tuple containing the statistics in that order.
+fn compute_stats(samples: &[f32]) -> (f32, f64, f32) {
     let raw_stats = samples.iter().fold(
-        (i16::MAX, 0i64, i16::MIN),
+        (f32::MAX, 0f64, f32::MIN),
         |stats, sample| (
             if sample < &stats.0 { *sample } else { stats.0 },
-            stats.1 + i64::from(*sample),
+            stats.1 + f64::from(*sample),
             if sample > &stats.2 { *sample } else { stats.2 }
         )
     );
 
     (
         raw_stats.0,
-        (raw_stats.1 / i64::try_from(samples.len()).unwrap()),
+        (raw_stats.1 / f64::try_from(samples.len()).unwrap()),
         raw_stats.2
     )
 }
@@ -48,16 +48,16 @@ pub async fn log_sample_stats<R: AsyncRead + Unpin>(
         if let Err(e) = stream.read_exact(&mut buf).await {
             error!("Stream failed with error: {:?}", e.kind());
         } else {
-            let (left, right): (Vec<i16>, Vec<i16>) = buf.chunks(4).map(|sample| (
-                LittleEndian::read_i16(&sample[..2]).saturating_abs(),
-                LittleEndian::read_i16(&sample[2..]).saturating_abs()
+            let (left, right): (Vec<f32>, Vec<f32>) = buf.chunks(4).map(|sample| (
+                LittleEndian::read_f32(&sample[..2]).abs(),
+                LittleEndian::read_f32(&sample[2..]).abs()
             )).unzip();
 
             let left_stats = compute_stats(&left);
             let right_stats = compute_stats(&right);
 
             info!(
-                "L(min: {} avg: {} max: {}), R(min: {}, avg: {}, max:{})",
+                "L(min: {:.5} avg: {:.5} max: {:.5}), R(min: {:.5}, avg: {:.5}, max:{:.5})",
                 left_stats.0,
                 left_stats.1,
                 left_stats.2,
