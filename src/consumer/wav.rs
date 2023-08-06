@@ -87,7 +87,7 @@ fn stream_to_wav<O: Write + Seek + 'static>(
         sample_rate: SAMPLE_RATE,
     })?.get_random_access_f32_writer()?;
 
-    if max_recording_len() > MAX_RECORDING_WARN_THRESHOLD {
+    if max_recording_len() < MAX_RECORDING_WARN_THRESHOLD {
         warn!(
             "Due to platform limitations, {} can only record {:.2} minutes of audio.\
              The application will shut down if this length is exceeded.",

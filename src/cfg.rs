@@ -7,7 +7,7 @@ use std::path::Path;
 
 use clap::{crate_name, Parser, ValueEnum};
 use configparser::ini::Ini;
-use log::{LevelFilter, warn};
+use log::LevelFilter;
 use regex::{Error as RegexError, Regex};
 
 use crate::consumer::discord::cfg::DiscordConfig;
@@ -127,8 +127,6 @@ pub struct Args {
     /// Selects the audio consumer to use when running the application. The
     /// available consumers depend on what features were enabled when bardcast
     /// was built.
-    ///
-    /// Defaults to the "discord" consumer.
     #[clap(long, value_enum, default_value = "discord")]
     pub consumer: SelectedConsumer,
 
@@ -328,7 +326,9 @@ impl ApplicationConfig {
     pub fn validate_semantics(&self, action: Action) -> Result<(), String> {
         if let Action::Run(consumer) = action {
             if self.output_file.is_some() && !consumer.needs_output_file() {
-                warn!("-o/--output-file does not make sense with the selected audio consumer, ignoring");
+                //This function may be called before the logging system is
+                //initialized, so use eprintln directly instead.
+                eprintln!("-o/--output-file does not make sense with the selected audio consumer, ignoring");
             } else if self.output_file.is_none() && consumer.needs_output_file() {
                 return Err(String::from("Selected audio consumer requires an output file to be specified"));
             }
