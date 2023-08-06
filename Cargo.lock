@@ -138,6 +138,7 @@ dependencies = [
  "stream-flatten-iters",
  "time",
  "tokio",
+ "wave_stream",
 ]
 
 [[package]]
@@ -2171,6 +2172,12 @@ dependencies = [
  "wasm-bindgen-futures",
  "web-sys",
 ]
+
+[[package]]
+name = "wave_stream"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cfcbfab82ee734d52b3c44f21ccb7e11d2e965f09232aeb9b83e75fa6e2cb9ef"
 
 [[package]]
 name = "web-sys"

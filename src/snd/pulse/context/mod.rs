@@ -63,12 +63,12 @@ const OP_QUEUE_SIZE: usize = 32;
 const SAMPLE_RATE: u32 = 48000;
 
 /// The size of the sample buffer in bytes.
-const SAMPLE_QUEUE_SIZE: usize = SAMPLE_RATE as usize;
+const SAMPLE_QUEUE_SIZE: usize = SAMPLE_RATE as usize * 2;
 
 /// PulseAudio [`SampleSpec`] definition matching the requirements of the driver
 /// specification.
 const SAMPLE_SPEC: SampleSpec = SampleSpec {
-    format: SampleFormat::S16le,
+    format: SampleFormat::F32le,
     channels: 2,
     rate: SAMPLE_RATE,
 };

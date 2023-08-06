@@ -206,7 +206,7 @@ impl ConnectedClient {
         self.call.lock().await.play_only_source(Input::new(
             true,
             Reader::Extension(stream.into_media_source()),
-            Codec::Pcm,
+            Codec::FloatPcm,
             Container::Raw,
             None
         ))

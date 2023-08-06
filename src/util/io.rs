@@ -11,11 +11,14 @@ use futures::io::AsyncReadExt;
 use ringbuf::ring_buffer::RbRef;
 use songbird::input::reader::MediaSource;
 
+// TYPE DEFINITIONS ************************************************************
+
 /// Wrapper around an [`AsyncConsumer`] that allows it to be used as an audio
 /// stream in the application.
 pub struct AsyncConsumerReadWrapper<R: RbRef>(AsyncConsumer<u8, R>)
 where <R as RbRef>::Rb: AsyncRbRead<u8>;
 
+// TRAIT IMPLS *****************************************************************
 impl<R: RbRef> From<AsyncConsumer<u8, R>> for AsyncConsumerReadWrapper<R>
 where <R as RbRef>::Rb: AsyncRbRead<u8> {
     fn from(rb_consumer: AsyncConsumer<u8, R>) -> Self {
