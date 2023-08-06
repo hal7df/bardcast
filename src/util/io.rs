@@ -2,7 +2,7 @@
 
 use std::borrow::{Borrow, BorrowMut};
 use std::convert::From;
-use std::io::{Error, ErrorKind, Read, Result, Seek, SeekFrom, Write};
+use std::io::{Error, ErrorKind, Read, Result, Seek, SeekFrom};
 
 use async_ringbuf::consumer::AsyncConsumer;
 use async_ringbuf::ring_buffer::AsyncRbRead;
@@ -12,7 +12,6 @@ use ringbuf::ring_buffer::RbRef;
 use songbird::input::reader::MediaSource;
 
 // TYPE DEFINITIONS ************************************************************
-pub struct SeekNotSupportedWrite<W: Write>(W);
 
 /// Wrapper around an [`AsyncConsumer`] that allows it to be used as an audio
 /// stream in the application.
@@ -20,28 +19,6 @@ pub struct AsyncConsumerReadWrapper<R: RbRef>(AsyncConsumer<u8, R>)
 where <R as RbRef>::Rb: AsyncRbRead<u8>;
 
 // TRAIT IMPLS *****************************************************************
-impl<W: Write> From<W> for SeekNotSupportedWrite<W> {
-    fn from(write: W) -> Self {
-        Self(write)
-    }
-}
-
-impl<W: Write> Write for SeekNotSupportedWrite<W> {
-    fn write(&mut self, buf: &[u8]) -> Result<usize> {
-        self.0.write(buf)
-    }
-
-    fn flush(&mut self) -> Result<()> {
-        self.0.flush()
-    }
-}
-
-impl<W: Write> Seek for SeekNotSupportedWrite<W> {
-    fn seek(&mut self, _pos: SeekFrom) -> Result<u64> {
-        Err(Error::from(ErrorKind::Unsupported))
-    }
-}
-
 impl<R: RbRef> From<AsyncConsumer<u8, R>> for AsyncConsumerReadWrapper<R>
 where <R as RbRef>::Rb: AsyncRbRead<u8> {
     fn from(rb_consumer: AsyncConsumer<u8, R>) -> Self {

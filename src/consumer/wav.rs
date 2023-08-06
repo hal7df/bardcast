@@ -1,7 +1,6 @@
 ///! Audio consumer that streams audio to a .wav file.
 
 use std::io::{
-    self,
     BufWriter,
     Error as IoError,
     ErrorKind,
@@ -22,7 +21,6 @@ use wave_stream::samples_by_channel::SamplesByChannel;
 use wave_stream::wave_header::{Channels, SampleFormat, WavHeader};
 
 use crate::util;
-use crate::util::io::SeekNotSupportedWrite;
 
 const SAMPLE_RATE: u32 = 48000;
 const MAX_RECORDING_WARN_THRESHOLD: Duration = Duration::from_secs(86400); // 1 day
@@ -35,34 +33,16 @@ pub fn record<S: Read + Send + 'static>(
     stream: S,
     shutdown_rx: Receiver<bool>
 ) -> Result<JoinHandle<()>, IoError> {
-    Ok(if output_file == "-" {
-        start_stream_to_wav(
-            BufWriter::new(SeekNotSupportedWrite::from(io::stdout())),
-            stream,
-            shutdown_rx
-        )
-    } else {
-        start_stream_to_wav(
-            BufWriter::new(File::create(output_file)?),
-            stream,
-            shutdown_rx
-        )
-    })
-}
+    let output = BufWriter::new(File::create(output_file)?);
 
-// INTERNAL HELPER FUNCTIONS ***************************************************
-/// Generic receiver method for [`record`].
-fn start_stream_to_wav<O: Write + Seek + Send + 'static, S: Read + Send + 'static>(
-    output: O,
-    stream: S,
-    shutdown_rx: Receiver<bool>
-) -> JoinHandle<()> {
-    task::spawn_blocking(move || {
+    Ok(task::spawn_blocking(move || {
         if let Err(e) = stream_to_wav(output, stream, shutdown_rx) {
             panic!("Wav output stream failed with error: {}", e);
         }
-    })
+    }))
 }
+
+// INTERNAL HELPER FUNCTIONS ***************************************************
 
 /// Determines the maximum recording length supported on this platform.
 const fn max_recording_len() -> Duration {
