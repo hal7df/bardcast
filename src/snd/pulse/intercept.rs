@@ -63,7 +63,7 @@ pub struct CapturingInterceptor {
 /// Implementation of [`Interceptor`] that duplicates application audio streams
 /// before reading them to allow the audio to reach a hardware sink in addition
 /// to being read by bardcast.
-pub struct PeekingInterceptor {
+pub struct DuplexingInterceptor {
     introspect: AsyncIntrospector,
     demux: OwnedSinkInfo,
     rec: OwnedSinkInfo,
@@ -86,8 +86,8 @@ impl CapturingInterceptor {
     }
 }
 
-impl PeekingInterceptor {
-    /// Creates a new `PeekingInterceptor`, using the given sink as the second
+impl DuplexingInterceptor {
+    /// Creates a new `DuplexingInterceptor`, using the given sink as the second
     /// output.
     pub async fn from_sink(
         introspect: &AsyncIntrospector,
@@ -172,7 +172,7 @@ impl Interceptor for CapturingInterceptor {
 }
 
 #[async_trait]
-impl Interceptor for PeekingInterceptor {
+impl Interceptor for DuplexingInterceptor {
     async fn intercept(&mut self, sink_input_id: u32) -> Result<(), Code> {
         self.introspect.move_sink_input_by_index(
             sink_input_id,
