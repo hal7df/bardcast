@@ -129,11 +129,11 @@ available on Unix systems when built with the `pulse` feature flag.
 
 | Option | Type | Description |
 | ------ | ---- | ----------- |
-| `intercept-mode` | `capture`, `peek`, `monitor` | The audio intercept mode that the driver should use. Defaults to `peek`. |
-| `stream-regex` | Regular expression | A regular expression that matches against applications that you want to capture. |
+| `intercept-mode` | `capture`, `monitor` | The audio intercept mode that the driver should use. Defaults to `capture`. |
+| `stream-regex` | Regular expression | A regular expression that matches against applications that you want to intercept. |
 | `stream-properties` | Comma-separated list | A list of PulseAudio property names to match `stream-regex` against. |
 | `server` | String | The path to the PulseAudio server. |
-| `sink-name` | String | The name of the audio sink to use with `peek` or `monitor` intercept modes. |
-| `sink-index` | u32 | The index of the audio sink to use with `peek` or `monitor` intercept modes. Overrides `sink-name` if both are set (unless `sink-name` is provided as a command line argument). |
+| `sink-name` | String | The name of the audio sink to use with the `monitor` intercept mode. |
+| `sink-index` | u32 | The index of the audio sink to use with the `monitor` intercept mode. Overrides `sink-name` if both are set (unless `sink-name` is provided as a command line argument). |
 | `volume` | 0.0 to 1.0 | Normalized volume level for the recording stream. |
 | `max-mainloop-interval-usec` | u64 | The maximum interval between mainloop iterations in microseconds. This can be tweaked if the application is becoming too laggy (decreasing the value) or using too much CPU (increasing the value), but ideally there should be no need to tweak this. Defaults to 20000us (20ms). |
