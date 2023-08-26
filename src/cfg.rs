@@ -46,8 +46,8 @@ pub struct Args {
 
     /// An identifier for the audio output that bardcast should interact with.
     /// The interpretation of this option depends on the selected capture mode.
-    /// Peek mode will use this output for all recorded audio, while monitor
-    /// mode will monitor all audio sent to this sink.
+    /// Monitor mode will either monitor this sink or duplex audio to this
+    /// sink (depending on whether a stream filter is configured).
     ///
     /// The format of this option depends on the underlying audio server, but
     /// will typically be the audio output's system index or name. If not
@@ -166,18 +166,18 @@ pub enum Action {
 /// Represents the approach the application uses to intercept system audio.
 #[derive(Clone, Copy, ValueEnum, Debug, PartialEq)]
 pub enum InterceptMode {
-    /// Capture system audio, preventing it from reaching a hardware audio
+    /// Capture system audio by using a dedicated capture stream. This will
+    /// prevent the original captured audio from being sent to a hardware audio
     /// output.
     Capture,
 
-    /// Capture system audio without preventing it from reaching a hardware
-    /// audio output.
-    Peek,
-
-    /// Rather than capture individual application audio streams, simply monitor
-    /// all sound played via a specific audio output. WARNING: When using this
-    /// mode, be sure the Discord voice chat is not also sending audio to the
-    /// same output, or you will get feedback.
+    /// Capture system audio by monitoring an existing system audio device, or
+    /// by duplexing the audio stream. This will allow audio to be consumed by
+    /// both bardcast and a hardware audio device.
+    ///
+    /// WARNING: This may cause feedback if used without a stream filter if,
+    /// for instance, the same Discord voice chat to which audio is being sent
+    /// is playing audio on the monitored device.
     Monitor,
 }
 
@@ -362,7 +362,6 @@ fn level_filter_from_string(raw: &str) -> Option<LevelFilter> {
 fn capture_mode_from_string(raw: &str) -> Option<InterceptMode> {
     match raw.to_ascii_uppercase().as_str() {
         "CAPTURE" => Some(InterceptMode::Capture),
-        "PEEK" => Some(InterceptMode::Peek),
         "MONITOR" => Some(InterceptMode::Monitor),
         _ => None,
     }

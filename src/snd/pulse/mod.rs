@@ -27,7 +27,7 @@ use libpulse::proplist::properties::{
 
 use crate::cfg::InterceptMode;
 use crate::util::task::{TaskSetBuilder, ValueJoinHandle};
-use self::intercept::{Interceptor, CapturingInterceptor, PeekingInterceptor};
+use self::intercept::{Interceptor, CapturingInterceptor, DuplexingInterceptor};
 use self::context::{AsyncIntrospector, PulseContextWrapper, SampleConsumer};
 use self::event::{
     AudioEntity,
@@ -178,9 +178,9 @@ async fn start_stream_intercept(
     event_rx: OwnedEventListener<OwnedSinkInputInfo>,
     matcher: ProplistMatcher,
     config: &PulseDriverConfig,
+    intercept_mode: InterceptMode,
 ) -> Result<ValueJoinHandle<String>, Code> {
     let introspect = AsyncIntrospector::from(ctx);
-    let capture_mode = config.intercept_mode.unwrap_or(InterceptMode::Peek);
 
     debug!("Establishing event listener for application stream intercept");
     let mut event_rx = event_rx.filter_map(move |event| {
@@ -208,16 +208,15 @@ async fn start_stream_intercept(
     });
 
     // Set up the stream interceptor
-    info!("Intercepting matched applications using mode: {:?}", capture_mode);
-    let intercept: Box<dyn Interceptor> = match capture_mode {
-        InterceptMode::Peek => Box::new(PeekingInterceptor::from_sink(
+    info!("Intercepting matched applications using mode: {:?}", intercept_mode);
+    let intercept: Box<dyn Interceptor> = match intercept_mode {
+        InterceptMode::Monitor => Box::new(DuplexingInterceptor::from_sink(
             &introspect,
             &resolve_configured_sink(&introspect, config).await?,
         ).await?),
         InterceptMode::Capture => Box::new(CapturingInterceptor::new(
             &introspect,
         ).await?),
-        _ => panic!("Attempted to start stream intercept with unsupported capture mode"),
     };
 
     let source_name = intercept.source_name();
@@ -296,38 +295,43 @@ async fn initialize(
         shutdown_rx
     );
 
-    let monitor_mode = config.intercept_mode.as_ref().is_some_and(|mode| *mode == InterceptMode::Monitor);
+    let intercept_mode = config.intercept_mode.unwrap_or(InterceptMode::Capture);
 
     // Determine the sink to read audio samples from
-    let rec_name = if monitor_mode {
-        let introspect = AsyncIntrospector::from(&ctx);
+    let rec_name = if let Some(stream_regex) = &config.stream_regex {
+        let props = if config.stream_properties.is_empty() {
+            vec![
+                APPLICATION_NAME,
+                APPLICATION_PROCESS_BINARY,
+            ].iter().map(|x| String::from(*x)).collect()
+        } else {
+            config.stream_properties.clone()
+        };
 
-        introspect.resolve_sink_monitor_name(resolve_configured_sink(
-            &introspect,
-            config
-        ).await?).await?
+        let matcher = ProplistMatcher::new(props, stream_regex.clone());
+        driver_tasks.detaching_insert(start_stream_intercept(
+            &ctx,
+            event_builder.build().await.map_err(|e| DriverComponent::EventHandler.to_error(e))?,
+            matcher,
+            config,
+            intercept_mode
+        ).await.map_err(|e| DriverComponent::Interceptor.to_error(e))?)
     } else {
-        // Application stream intercept should only be used if a filter is present
-        if let Some(stream_regex) = &config.stream_regex {
-            let props = if config.stream_properties.is_empty() {
-                vec![
-                    APPLICATION_NAME,
-                    APPLICATION_PROCESS_BINARY,
-                ].iter().map(|x| String::from(*x)).collect()
-            } else {
-                config.stream_properties.clone()
-            };
-
-            let matcher = ProplistMatcher::new(props, stream_regex.clone());
-            driver_tasks.detaching_insert(start_stream_intercept(
-                &ctx,
-                event_builder.build().await.map_err(|e| DriverComponent::EventHandler.to_error(e))?,
-                matcher,
+        if intercept_mode == InterceptMode::Monitor {
+            let introspect = AsyncIntrospector::from(&ctx);
+            let rec_name = introspect.resolve_sink_monitor_name(resolve_configured_sink(
+                &introspect,
                 config
-            ).await.map_err(|e| DriverComponent::Interceptor.to_error(e))?)
+            ).await?).await?;
+            
+            warn!("Monitor intercept mode is being used without a stream filter. \
+                   This may cause feedback if the output stream is being played\
+                   back on the monitored audio device ('{}')", rec_name);
+
+            rec_name
         } else {
             return Err(PulseDriverError::BadConfig(String::from(
-                "`capture' and `peek' intercept modes require -E/--stream-regex"
+                "The `capture' intercept mode requires -E/--stream-regex"
             )));
         }
     };

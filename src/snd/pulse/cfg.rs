@@ -29,9 +29,8 @@ pub struct PulseDriverConfig {
     pub server: Option<String>,
 
     /// The name of the existing sink that bardcast should interact with,
-    /// according to the [`intercept_mode`]. For `Peek` mode, this is the sink
-    /// that audio is routed to after being intercepted. For `Monitor` mode,
-    /// this is the sink that is monitored.
+    /// according to the [`intercept_mode`].  For `Monitor` mode, this is the
+    /// sink that is monitored.
     ///
     /// This is ignored if [`sink_index`] is set.
     pub sink_name: Option<String>,
@@ -41,9 +40,8 @@ pub struct PulseDriverConfig {
     pub volume: Option<f64>,
 
     /// The index of the existing sink that bardcast should interact with,
-    /// according to the [`intercept_mode`]. For `Peek` mode, this is the sink
-    /// that audio is routed to after being intercepted. For `Monitor` mode,
-    /// this is the sink that is monitored.
+    /// according to the [`intercept_mode`]. For `Monitor` mode, this is the
+    /// sink that is monitored.
     ///
     /// This option takes precedence over [`sink_name`] if both are set.
     pub sink_index: Option<u32>,
