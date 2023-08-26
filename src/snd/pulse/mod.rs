@@ -324,7 +324,7 @@ async fn initialize(
                 config
             ).await?).await?;
             
-            warn!("Monitor intercept mode is being used without a stream filter.\
+            warn!("Monitor intercept mode is being used without a stream filter. \
                    This may cause feedback if the output stream is being played\
                    back on the monitored audio device ('{}')", rec_name);
 
