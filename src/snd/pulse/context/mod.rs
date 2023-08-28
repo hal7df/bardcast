@@ -176,10 +176,18 @@ impl PulseContextWrapper {
 
         Ok(ValueJoinHandle::new(sample_rx, task::spawn_local(async move {
             let notify = StreamReadNotifier::new(&mut stream);
+            let mut wait_free_len = 0usize;
 
-            while should_continue_stream_read(&sample_tx, &notify).await {
+            while should_continue_stream_read(
+                &sample_tx,
+                &notify,
+                wait_free_len
+            ).await {
+                wait_free_len = 0;
+
                 match stream.peek() {
                     Ok(PeekResult::Data(samples)) => {
+                        wait_free_len = sample_tx.capacity() - ((sample_tx.len() + samples.len()) / 3);
                         if sample_tx.push_iter(samples.iter().map(|x| *x)).await.is_err() {
                             //If this happens, we can break the loop immediately,
                             //since we know the receiver dropped.
@@ -651,12 +659,17 @@ fn create_and_connect_stream(
 /// needless iterating over a stream with no data.
 async fn should_continue_stream_read(
     sample_tx: &AsyncProducer<u8, Arc<AsyncRb<u8, HeapRb<u8>>>>,
-    notify: &StreamReadNotifier
+    notify: &StreamReadNotifier,
+    wait_free_len: usize
 ) -> bool {
     if sample_tx.is_closed() {
         false
     } else {
-        notify.await_data().await;
+        if wait_free_len > 0 {
+            sample_tx.wait_free(wait_free_len).await;
+        } else {
+            notify.await_data().await;
+        }
         true
     }
 }
