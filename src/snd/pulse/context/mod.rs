@@ -3,6 +3,7 @@
 mod async_polyfill;
 pub mod collect;
 mod introspect;
+mod stream;
 
 extern crate libpulse_binding as libpulse;
 
@@ -149,104 +150,6 @@ impl PulseContextWrapper {
         if self.op_queue.send(Box::new(op)).await.is_err() {
             panic!("PulseAudio context handler task unexpectedly terminated");
         }
-    }
-
-    /// Opens a recording stream against the audio source with the given name,
-    /// at the requested volume, if any. Returns a consuming handle for the
-    /// stream and the underlying task performing the raw stream handling in a
-    /// [`ValueJoinHandle`].
-    pub async fn open_rec_stream(
-        &self,
-        source_name: impl ToString,
-        volume: Option<f64>
-    ) -> Result<ValueJoinHandle<SampleConsumer>, Code> {
-        let mut stream = self.get_connected_stream(source_name.to_string()).await?;
-        let (mut sample_tx, sample_rx) = AsyncRb::<u8, HeapRb<u8>>::new(SAMPLE_QUEUE_SIZE).split();
-
-        if let Some(volume) = volume {
-            AsyncIntrospector::from(self).set_source_output_volume(
-                stream.get_index().unwrap(),
-                volume
-            ).await?
-        }
-
-        //Create a handle to the context queue, to force the mainloop to stay
-        //open while we're still processing samples
-        let self_handle = self.clone();
-
-        Ok(ValueJoinHandle::new(sample_rx, task::spawn_local(async move {
-            let notify = StreamReadNotifier::new(&mut stream);
-
-            while should_continue_stream_read(&sample_tx, &notify).await {
-                match stream.peek() {
-                    Ok(PeekResult::Data(samples)) => {
-                        if sample_tx.push_iter(samples.iter().map(|x| *x)).await.is_err() {
-                            //If this happens, we can break the loop immediately,
-                            //since we know the receiver dropped.
-                            debug!("Sample receiver dropped while transmitting samples");
-                            break;
-                        }
-                        if let Err(e) = stream.discard() {
-                            warn!("Failure to discard stream sample: {}", e);
-                        }
-                    },
-                    Ok(PeekResult::Hole(hole_size)) => {
-                        warn!("PulseAudio stream returned hole of size {} bytes", hole_size);
-                        if let Err(e) = stream.discard() {
-                            warn!( "Failure to discard stream sample: {}", e);
-                        }
-                    },
-                    Ok(PeekResult::Empty) => {
-                        trace!("PulseAudio stream had no data");
-                    },
-                    Err(e) => error!(
-                        "Failed to read audio from PulseAudio: {}",
-                        e
-                    ),
-                }
-            }
-
-            debug!("Stream handler shutting down");
-            notify.close(&mut stream);
-
-            //Tear down the record stream
-            if let Err(e) = stream.disconnect() {
-                if let Some(msg) = e.to_string() {
-                    warn!("Record stream failed to disconnect: {}", msg);
-                } else {
-                    warn!("Record stream failed to disconnect (code {})", e.0);
-                }
-            }
-            mem::drop(self_handle);
-
-            debug!("Stream handler shut down");
-        })))
-    }
-
-    /// Creates and returns a new recording stream against the source with the
-    /// given name.
-    async fn get_connected_stream(
-        &self,
-        source_name: String
-    ) -> Result<Stream, Code> {
-        let (tx, rx) = oneshot::channel();
-
-        self.with_ctx(move |ctx| {
-            if tx.send(create_and_connect_stream(ctx, &source_name)).is_err() {
-                panic!("Stream receiver unexpectedly terminated");
-            }
-        }).await;
-
-        // Note: stream_fut makes PulseAudio API calls directly, so we need
-        // to await it in a local task.
-        let stream_fut = rx.await.map_err(|_| Code::NoData)??;
-        task::spawn_local(stream_fut).await
-            .map_err(|_| Code::Killed)?
-            .map_err(|state| if state == StreamState::Terminated {
-                Code::Killed
-            } else {
-                Code::BadState
-            })
     }
 
     /// Core implementation of the [`PulseWrapper::do_ctx_op`] family of
