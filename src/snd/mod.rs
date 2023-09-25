@@ -96,7 +96,7 @@ pub enum DriverStartError {
 /// Internal specialization of errors thrown specifically by sound drivers
 /// during initialization.
 #[derive(Debug)]
-pub enum DriverInitError<E> {
+enum DriverInitError<E> {
     /// The sound driver failed to connect to its backend, with a
     /// driver-provided error type providing details.
     ///
