@@ -8,8 +8,8 @@
 ///!      addition to common driver options provided on the command line (e.g.
 ///!      stream volume, application intercept options).
 ///!   2. An entry point function that returns a [`Driver`] instance, consisting
-///!      of an [`AudioStream`] implementation that provides a signed 16-bit
-///!      little-endian stereo audio stream at 48 kHz to be consumed by the
+///!      of an [`AudioStream`] implementation that provides an IEEE 754 32-bit
+///!      floating point stereo audio stream at 48 kHz to be consumed by the
 ///!      audio consumer, and a collection of [`tokio::task::JoinHandle`]s for
 ///!      any ongoing tasks the driver spawns to manage the audio stream.
 ///!   3. A unique name identifying the driver. This should be named according
@@ -29,18 +29,17 @@ pub mod pulse;
 
 use std::error::Error;
 use std::fmt::{Display, Error as FormatError, Formatter};
-use std::pin::Pin;
+use std::mem;
 
 use async_ringbuf::consumer::AsyncConsumer;
 use async_ringbuf::ring_buffer::AsyncRbRead;
+use async_trait::async_trait;
 use futures::io::AsyncRead;
 use log::{debug, info};
 use ringbuf::ring_buffer::RbRef;
-use songbird::input::reader::MediaSource;
 use tokio::sync::watch::Receiver;
 
 use crate::cfg::ApplicationConfig;
-use crate::util::io::AsyncConsumerReadWrapper;
 use crate::util::task::TaskContainer;
 
 /// List of all sound drivers compiled in the application. When not specified,
@@ -50,20 +49,22 @@ const DRIVERS: &'static [&'static str] = &[
     pulse::DRIVER_NAME
 ];
 
+/// The size of a stereo IEEE 754 32-bit floating point audio sample.
+const F32LE_STEREO_SAMPLE_SIZE: usize = mem::size_of::<f32>() * 2;
+
 // TYPE DEFINITIONS ************************************************************
 
-/// Wrapper trait representing an audio stream that can be read by the audio
-/// consumer.
-///
-/// Regardless of the trait that the `AudioStream` is ultimately converted into,
-/// the stream should read a signed 16-bit little-endian stereo audio stream
-/// (where the left audio sample comes before the right) at 48 kHz, encoded as
+/// Extension trait to AsyncRead that enables an audio stream reader to
+/// non-destructively detect when data is written to the stream. This stream
+/// should contain IEEE 754 32-bit float stereo audio samples (where the left
+/// audio sample comes before the right) at a sample rate of 48kHz, encoded as
 /// bytes.
-pub trait AudioStream: Send + Sync {
-    fn into_media_source_impl(self) -> Box<dyn MediaSource + Send>;
-    fn into_async_read_impl(self) -> Pin<Box<dyn AsyncRead + Send>>;
-    fn into_media_source(self: Box<Self>) -> Box<dyn MediaSource + Send>;
-    fn into_async_read(self: Box<Self>) -> Pin<Box<dyn AsyncRead + Send>>;
+#[async_trait]
+pub trait AudioStream: AsyncRead + Send + Sync {
+    /// Waits for at least one stereo audio sample to be written to the stream,
+    /// signaling for playback to resume if it has stopped due to a lack of
+    /// data.
+    async fn await_samples(&self);
 }
 
 /// Wrapper struct for the two functional components of an audio driver: its
@@ -134,22 +135,11 @@ impl Driver {
 }
 
 // TRAIT IMPLS *****************************************************************
+#[async_trait]
 impl<R: RbRef + Send + Sync + 'static> AudioStream for AsyncConsumer<u8, R>
 where <R as RbRef>::Rb: AsyncRbRead<u8> {
-    fn into_media_source_impl(self) -> Box<dyn MediaSource + Send> {
-        Box::new(AsyncConsumerReadWrapper::from(self))
-    }
-
-    fn into_async_read_impl(self) -> Pin<Box<dyn AsyncRead + Send>> {
-        Box::pin(self)
-    }
-
-    fn into_media_source(self: Box<Self>) -> Box<dyn MediaSource + Send> {
-        self.into_media_source_impl()
-    }
-
-    fn into_async_read(self: Box<Self>) -> Pin<Box<dyn AsyncRead + Send>> {
-        self.into_async_read_impl()
+    async fn await_samples(&self) {
+        self.wait(F32LE_STEREO_SAMPLE_SIZE).await;
     }
 }
 

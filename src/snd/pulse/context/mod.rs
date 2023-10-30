@@ -13,11 +13,9 @@ use std::mem;
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
-use async_ringbuf::{AsyncConsumer, AsyncProducer, AsyncRb};
 use clap::crate_name;
 use itertools::Itertools;
 use log::{debug, error, warn, trace};
-use ringbuf::HeapRb;
 use tokio::sync::mpsc::{
     self,
     Sender as MpscSender,
@@ -25,31 +23,20 @@ use tokio::sync::mpsc::{
 };
 use tokio::sync::oneshot::{
     self,
-    Receiver as OneshotReceiver,
-    Sender as OneshotSender
+    Receiver as OneshotReceiver
 };
-use tokio::task::{self, JoinError, JoinHandle};
+use tokio::task::{self, JoinHandle};
 use tokio::time;
 
-use libpulse::channelmap::Map as ChannelMap;
 use libpulse::context::{Context, FlagSet, State as ContextState};
 use libpulse::error::Code;
 use libpulse::mainloop::standard::{IterateResult, Mainloop};
 use libpulse::operation::{Operation, State as OperationState};
 use libpulse::sample::{Format as SampleFormat, Spec as SampleSpec};
-use libpulse::stream::{
-    FlagSet as StreamFlagSet,
-    PeekResult,
-    State as StreamState,
-    Stream
-};
 
-use self::async_polyfill::{
-    InitializingFuture,
-    StreamReadNotifier
-};
+use self::async_polyfill::InitializingFuture;
 use crate::util;
-use crate::util::task::ValueJoinHandle;
+use crate::util::task::{ControlledJoinHandle, ValueJoinHandle};
 
 // RE-EXPORTS ******************************************************************
 pub use self::introspect::AsyncIntrospector;
@@ -83,9 +70,6 @@ const MAINLOOP_ITER_TRACKING_LEN: usize = 5;
 
 // TYPE DEFINITIONS ************************************************************
 
-/// Type alias for the concrete audio consumer type.
-pub type SampleConsumer = AsyncConsumer<u8, Arc<AsyncRb<u8, HeapRb<u8>>>>;
-
 /// Type alias for submitted context operations.
 type ContextThunk = Box<dyn FnOnce(&mut Context) + Send + 'static>;
 
@@ -113,9 +97,6 @@ struct MainloopHandler {
     last_iter: Instant,
     max_interval: Duration,
 }
-
-/// A handle to cancel an actively running [`MainloopHandler`].
-struct MainloopHandle(OneshotSender<()>, JoinHandle<()>);
 
 // TYPE IMPLS ******************************************************************
 impl PulseContextWrapper {
@@ -146,7 +127,8 @@ impl PulseContextWrapper {
     /// from the task, either use [`PulseContextWrapper::do_ctx_op`] and its
     /// cohort, or manually implement the return channel in the submitted
     /// operation.
-    pub async fn with_ctx<F: FnOnce(&mut Context) + Send + 'static>(&self, op: F) {
+    pub async fn with_ctx<F>(&self, op: F)
+    where F: FnOnce(&mut Context) + Send + 'static {
         if self.op_queue.send(Box::new(op)).await.is_err() {
             panic!("PulseAudio context handler task unexpectedly terminated");
         }
@@ -388,36 +370,10 @@ impl MainloopHandler {
     }
 
     /// Launches a dedicated task to execute the mainloop.
-    fn start(mut self) -> MainloopHandle {
-        let (tx, rx) = oneshot::channel();
-
-        MainloopHandle(tx, task::spawn_local(async move {
+    fn start(mut self) -> ControlledJoinHandle<()> {
+        ControlledJoinHandle::from(|rx| task::spawn_local(async move {
             self.mainloop(rx).await;
         }))
-    }
-}
-
-impl MainloopHandle {
-    /// Awaits a potential termination of the mainloop task without consuming
-    /// the handle, to allow cancellations and reuse.
-    async fn await_termination(&mut self) -> Result<(), JoinError> {
-        (&mut self.1).await
-    }
-
-    /// Sends a shutdown signal to the mainloop task and waits for it to
-    /// terminate.
-    async fn stop(self) {
-        if self.0.send(()).is_err() {
-            warn!("Failed to terminated mainloop, it may already have exited");
-        }
-
-        if !self.1.is_finished() {
-            if let Err(e) = self.1.await {
-                if e.is_panic() {
-                    warn!("Mainloop task panicked upon shutdown");
-                }
-            }
-        }
     }
 }
 
@@ -431,7 +387,7 @@ impl MainloopHandle {
 fn pulse_init(
     server: Option<&str>,
     max_mainloop_interval_usec: Option<u64>
-) -> Result<(MainloopHandle, InitializingFuture<ContextState, Context>), Code> {
+) -> Result<(ControlledJoinHandle<()>, InitializingFuture<ContextState, Context>), Code> {
     let mainloop = Mainloop::new().ok_or(Code::BadState)?;
     let mut ctx = Context::new(
         &mainloop,
@@ -466,6 +422,14 @@ fn pulse_init(
     ))
 }
 
+async fn stop_mainloop(mainloop_handle: ControlledJoinHandle<()>) {
+    if let Err(e) = mainloop_handle.join().await {
+        if e.is_panic() {
+            warn!("Mainloop task panicked on shutdown");
+        }
+    }
+}
+
 /// Initializes a PulseAudio [`Context`] and spawns a local task to receive and
 /// execute context operations from the given `op_queue`.
 async fn start_context_handler(
@@ -487,7 +451,7 @@ async fn start_context_handler(
                     trace!("Context handler awaiting next job");
                     tokio::select! {
                         biased;
-                        _ = mainloop_handle.await_termination() => panic!("Mainloop terminated unexpectedly"),
+                        _ = mainloop_handle.await_completion() => panic!("Mainloop terminated unexpectedly"),
                         op = op_queue.recv() => if let Some(op) = op {
                             op(&mut ctx);
                         } else {
@@ -499,67 +463,18 @@ async fn start_context_handler(
 
                 debug!("Context handler shutting down");
                 ctx.disconnect();
-                mainloop_handle.stop().await;
+                stop_mainloop(mainloop_handle);
                 debug!("Context handler shut down");
             }))
         },
         Err(state) => {
             error!("PulseAudio context failed to connect");
-
-            mainloop_handle.stop().await;
+            stop_mainloop(mainloop_handle);
             Err(if state == ContextState::Terminated {
                 Code::ConnectionTerminated
             } else {
                 Code::Unknown
             })
         }
-    }
-}
-
-/// Creates a recording stream against the named audio source, returning it
-/// as an [`InitializingFuture`] that resolves once the stream enters the ready
-/// state.
-fn create_and_connect_stream(
-    ctx: &mut Context,
-    source_name: impl AsRef<str>
-) -> Result<InitializingFuture<StreamState, Stream>, Code> {
-    //Technically init_stereo should create a new channel map with the format
-    //specifier "front-left,front-right", but due to oddities in the Rust
-    //binding for PulseAudio, we have to manually specify the format first. We
-    //call init_stereo anyways to make sure we are always using the server's
-    //understanding of stereo audio.
-    let mut channel_map = ChannelMap::new_from_string("front-left,front-right")
-        .map_err(|_| Code::Invalid)?;
-    channel_map.init_stereo();
-
-    let mut stream = Stream::new(
-        ctx,
-        "capture stream",
-        &SAMPLE_SPEC,
-        Some(&channel_map)
-    ).expect("Failed to open record stream");
-
-    stream.connect_record(
-        Some(source_name.as_ref()),
-        None,
-        StreamFlagSet::START_UNMUTED
-    ).map_err(|pa_err| Code::try_from(pa_err).unwrap_or(Code::Unknown))?;
-
-    Ok(InitializingFuture::from(stream))
-}
-
-/// Determines if the stream handler should continue reading samples, or exit.
-///
-/// This also waits for data to appear in the underlying stream, to prevent
-/// needless iterating over a stream with no data.
-async fn should_continue_stream_read(
-    sample_tx: &AsyncProducer<u8, Arc<AsyncRb<u8, HeapRb<u8>>>>,
-    notify: &StreamReadNotifier
-) -> bool {
-    if sample_tx.is_closed() {
-        false
-    } else {
-        notify.await_data().await;
-        true
     }
 }

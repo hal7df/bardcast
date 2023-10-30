@@ -6,6 +6,12 @@ use std::vec::Vec;
 
 use async_trait::async_trait;
 use futures::future::{self, SelectAll};
+use log::warn;
+use tokio::sync::oneshot::{
+    self,
+    Receiver as OneshotReceiver,
+    Sender as OneshotSender
+};
 use tokio::task::{JoinError, JoinHandle, JoinSet};
 
 // TYPE DEFINITIONS ************************************************************
@@ -18,6 +24,14 @@ use tokio::task::{JoinError, JoinHandle, JoinSet};
 /// the wrapper should be consumed with [`AbortingJoinHandle::take`].
 #[derive(Default)]
 pub struct AbortingJoinHandle<T>(Option<JoinHandle<T>>);
+
+/// Wrapper around a [`JoinHandle`] that has the ability to send a graceful
+/// shutdown signal to the underlying task, allowing it to clean up before
+/// terminating.
+pub enum ControlledJoinHandle<T> {
+    ActiveTask(JoinHandle<T>, OneshotSender<()>),
+    Returned(Result<T, JoinError>),
+}
 
 /// Wrapper utility that allows for initialization funcions to return both a
 /// value and a [`JoinHandle`] for a task that was spawned during initialization.
@@ -49,6 +63,66 @@ pub trait TaskContainer<T> {
 }
 
 // TYPE IMPLS ******************************************************************
+impl<T> AbortingJoinHandle<T> {
+    /// Consumes the [`AbortingJoinHandle`], returning the underlying task
+    /// handle without aborting it.
+    pub fn take(&mut self) -> Option<JoinHandle<T>> {
+        mem::take(&mut self.0)
+    }
+}
+
+impl<T> ControlledJoinHandle<T> {
+    /// Aborts the underlying task without sending a stop signal. Identical to
+    /// [`JoinHandle::abort`].
+    pub fn abort(&self) {
+        if let Self::ActiveTask(task, _) = self {
+            task.abort();
+        }
+    }
+
+    /// Checks if the task associated with this `ControlledJoinHandle` has
+    /// finished.
+    ///
+    /// As with [`JoinHandle::is_finished`], this method can return `false` even
+    /// if [`ControlledJoinHandle::abort`] has been called on the task, as this
+    /// does not return true until the task has actually stopped, which does not
+    /// happen immediately when a task is aborted.
+    pub fn is_finished(&self) -> bool {
+        if let Self::ActiveTask(task, _) = self {
+            task.is_finished()
+        } else {
+            true
+        }
+    }
+
+    /// Waits for the underlying task to return a result, without aborting or
+    /// signaling to the task to quit.
+    pub async fn await_completion(&mut self) {
+        if let Self::ActiveTask(task, _) = self {
+            let result = task.await;
+            *self = Self::Returned(result);
+        }
+    }
+
+    /// Signals the underlying task to quit, and waits for it to return a
+    /// result. If the underlying task has closed its control handle, the task
+    /// will be aborted.
+    pub async fn join(self) -> Result<T, JoinError> {
+        match self {
+            Self::ActiveTask(task, control_tx) => {
+                if control_tx.send(()).is_err() && !task.is_finished() {
+                    warn!("Controlled task closed its control handle but is \
+                           still running. It will be forcibly aborted.");
+                    task.abort();
+                }
+
+                task.await
+            },
+            Self::Returned(result) => result,
+        }
+    }
+}
+
 impl<T> ValueJoinHandle<T> {
     /// Creates a new [`ValueJoinHandle`] from the given value and task handle.
     pub fn new(val: T, task: JoinHandle<()>) -> Self {
@@ -59,14 +133,6 @@ impl<T> ValueJoinHandle<T> {
     /// task handle.
     pub fn into_tuple(self) -> (T, JoinHandle<()>) {
         (self.0, self.1)
-    }
-}
-
-impl<T> AbortingJoinHandle<T> {
-    /// Consumes the [`AbortingJoinHandle`], returning the underlying task
-    /// handle without aborting it.
-    pub fn take(&mut self) -> Option<JoinHandle<T>> {
-        mem::take(&mut self.0)
     }
 }
 
@@ -101,6 +167,15 @@ impl TaskSetBuilder {
 }
 
 /// TRAIT IMPLS ****************************************************************
+impl<F, T> From<F> for ControlledJoinHandle<T>
+where F: FnOnce(OneshotReceiver<()>) -> JoinHandle<T> {
+    fn from(spawn_fn: F) -> Self {
+        let (tx, rx) = oneshot::channel::<()>();
+
+        Self::ActiveTask(spawn_fn(rx), tx)
+    }
+}
+
 #[async_trait]
 impl TaskContainer<()> for TaskSet {
     async fn join_next(&mut self) -> Option<Result<(), JoinError>> {

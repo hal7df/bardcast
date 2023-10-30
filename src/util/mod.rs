@@ -176,12 +176,10 @@ impl<T> DerefMut for Lease<T> {
 
 impl<T> Drop for Lease<T> {
     fn drop(&mut self) {
-        unsafe {
-            let value = ManuallyDrop::take(&mut self.value);
+        let value = unsafe { ManuallyDrop::take(&mut self.value) };
 
-            if self.tx.send(value).is_err() {
-                debug!("Lessor went out of scope while value lease was active");
-            }
+        if self.tx.send(value).is_err() {
+            debug!("Lessor went out of scope while value lease was active");
         }
     }
 }

@@ -25,10 +25,12 @@ use libpulse::stream::{
     Stream
 };
 
+use crate::snd::F32LE_STEREO_SAMPLE_SIZE;
 use crate::util::task::ValueJoinHandle;
 use super::super::owned::OwnedSinkInputInfo;
 use super::{AsyncIntrospector, PulseContextWrapper};
 use super::async_polyfill::{InitializingFuture, StreamReadNotifier};
+
 
 // MODULE-INTERNAL CONSTANTS ***************************************************
 
@@ -46,9 +48,6 @@ const SAMPLE_SPEC: SampleSpec = SampleSpec {
     channels: 2,
     rate: SAMPLE_RATE,
 };
-
-/// The size of a stereo IEEE 754 32-bit floating point audio sample.
-const F32LE_STEREO_SAMPLE_SIZE: usize = mem::size_of::<f32>() * 2;
 
 /// The maximum number of stereo IEEE 754 32-bit floating point audio samples
 /// that can be counted by a usize.
