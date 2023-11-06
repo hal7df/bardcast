@@ -4,6 +4,7 @@
 use std::collections::HashSet;
 use std::mem;
 use std::path::Path;
+use std::time::Duration;
 
 use clap::{crate_name, Parser, ValueEnum};
 use configparser::ini::Ini;
@@ -230,6 +231,10 @@ pub struct ApplicationConfig {
     #[cfg(feature = "wav")]
     pub output_file: Option<String>,
 
+    /// A timeout, in milliseconds, used to determine when an audio stream has
+    /// become stale.
+    pub stream_timeout: Option<Duration>,
+
     /// The number of threads to use in the application runtime.
     pub threads: Option<usize>,
 }
@@ -264,6 +269,7 @@ impl TryFrom<Args> for ApplicationConfig {
             driver_name: args.driver_name,
             #[cfg(feature = "wav")]
             output_file: args.output_file,
+            stream_timeout: None,
             threads: args.threads,
         })
     }
@@ -295,6 +301,7 @@ impl ApplicationConfig {
             driver_name: config.get(crate_name!(), "driver"),
             #[cfg(feature = "wav")]
             output_file: config.get("wav", "output-file"),
+            stream_timeout: validate_stream_timeout(&config.getuint(crate_name!(), "stream-timeout-ms"))?,
             threads: validate_thread_count(&config.getuint(crate_name!(), "threads")?)?,
         })
     }
@@ -310,6 +317,7 @@ impl ApplicationConfig {
         merge_opt(&mut self.driver_name, other.driver_name);
         #[cfg(feature = "wav")]
         merge_opt(&mut self.output_file, other.output_file);
+        merge_opt(&mut self.stream_timeout, other.stream_timeout);
         merge_opt(&mut self.threads, other.threads);
     }
 
@@ -405,6 +413,12 @@ fn validate_log_level(raw_level: &Option<String>) -> Result<Option<LevelFilter>,
     raw_level.as_ref().map(|l| {
         level_filter_from_string(l).ok_or(String::from("Unknown log level"))
     }).transpose()
+}
+
+fn validate_stream_timeout(raw_timeout: &Result<Option<u64>, String>) -> Result<Option<Duration>, String> {
+    raw_timeout.map(|timeout| timeout.map(
+            |timeout_ms| Duration::from_millis(timeout_ms)
+    )).map_err(|s| format!("stream-timeout-ms: Not a valid timeout: {}", s))
 }
 
 /// Validates that a `u64` can be contained in a `usize`, and returns a

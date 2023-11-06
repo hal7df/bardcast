@@ -18,6 +18,7 @@ use tokio::task::{JoinError, LocalSet};
 
 use self::cfg::{Action, Args, ApplicationConfig, SelectedConsumer};
 use self::consumer::discord;
+use self::util::io::AsyncReadAdapter;
 use self::util::fmt as fmt_util;
 use self::util::task::{TaskContainer, TaskSetBuilder};
 
@@ -221,11 +222,14 @@ fn start(
                     SelectedConsumer::Wav => {
                         if let Some(output_file) = &config.output_file {
                             let mut tasks = TaskSetBuilder::new();
-                            let record_result = wav::record(
+                            let record_result = local.run_until(wav::record(
                                 output_file,
-                                stream.into_media_source(),
+                                AsyncReadAdapter::new(
+                                    stream,
+                                    config.stream_timeout
+                                ),
                                 shutdown_rx
-                            );
+                            )).await;
 
                             match record_result {
                                 Ok(task) => {

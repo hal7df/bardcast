@@ -30,6 +30,7 @@ pub mod pulse;
 use std::error::Error;
 use std::fmt::{Display, Error as FormatError, Formatter};
 use std::mem;
+use std::pin::Pin;
 
 use async_ringbuf::consumer::AsyncConsumer;
 use async_ringbuf::ring_buffer::AsyncRbRead;
@@ -70,7 +71,7 @@ pub trait AudioStream: AsyncRead + Send + Sync {
 /// Wrapper struct for the two functional components of an audio driver: its
 /// stream and any tasks it needs to stay alive.
 pub struct Driver {
-    stream: Box<dyn AudioStream>,
+    stream: Pin<Box<dyn AudioStream>>,
     driver_tasks: Box<dyn TaskContainer<()>>,
 }
 
@@ -123,13 +124,13 @@ impl Driver {
     where S: AudioStream + 'static,
           T: TaskContainer<()> + 'static {
         Self {
-            stream: Box::new(stream),
+            stream: Box::pin(stream),
             driver_tasks: Box::new(tasks),
         }
     }
 
     /// Consumes this driver into its constituent parts.
-    pub fn into_tuple(self) -> (Box<dyn AudioStream>, Box<dyn TaskContainer<()>>) {
+    pub fn into_tuple(self) -> (Pin<Box<dyn AudioStream>>, Box<dyn TaskContainer<()>>) {
         (self.stream, self.driver_tasks)
     }
 }
