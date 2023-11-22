@@ -4,14 +4,16 @@ pub mod cfg;
 mod client;
 pub mod error;
 
+use std::borrow::Borrow;
 use std::cmp;
+use std::io::Read;
 use std::mem;
 use std::sync::Arc;
 
 use clap::{crate_name, crate_version};
 use futures::future::{self, Either, FutureExt, TryFutureExt};
 use futures::stream::{self, Stream, TryStreamExt};
-use log::{info, warn};
+use log::{error, info, warn};
 use serenity::CacheAndHttp;
 use serenity::http::{CacheHttp, GuildPagination, Http};
 use serenity::model::guild::{GuildInfo, PartialGuild};
@@ -20,6 +22,7 @@ use serenity::model::user::User;
 use serenity::prelude::SerenityError;
 use serenity::utils::MessageBuilder;
 use songbird::{Call, Songbird};
+use songbird::error::TrackError;
 use songbird::input::{Container, Input};
 use songbird::input::codec::Codec;
 use songbird::input::reader::Reader;
@@ -31,6 +34,7 @@ use tokio::sync::watch::Receiver as WatchReceiver;
 use tokio::task::JoinHandle;
 
 use crate::snd::AudioStream;
+use crate::util::Lessor;
 use crate::util::fmt as fmt_util;
 use self::cfg::DiscordConfig;
 use self::client::{ChannelResolutionReceiver, Channels};
@@ -151,99 +155,67 @@ impl ConnectedClient {
 
     /// Entry point for the main Discord client logic. Panics if the client
     /// exits abnormally.
-    async fn run(
+    async fn run<I, S>(
         mut self,
-        stream: Box<dyn AudioStream>,
-        shutdown_rx: WatchReceiver<bool>
-    ) {
-        let track = self.startup(stream).await;
-        let shutdown_res = self.until_shutdown(shutdown_rx).await;
-        self.cleanup(track).await;
-
-        //If the shutdown condition is an error, then panic the thread to cause
-        //the rest of the application to shut down
-        if let Err(e) = shutdown_res {
-            panic!("Discord client crashed: {}", e);
-        }
-    }
-
-    /// Sends a startup message to the metadata channel (if configured) and
-    /// begins playing audio into the connected voice chat.
-    async fn startup(&self, stream: Box<dyn AudioStream>) -> TrackHandle {
-        //Try to post an initialization message to the configured metadata
-        //channel
-        if let Some(metadata_channel) = self.channels.metadata {
-            match self.channels.voice.to_channel(&self.cache_http).await {
-                Ok(voice_channel) => {
-                    let msg = MessageBuilder::new()
-                        .push(crate_name!())
-                        .push(" version ")
-                        .push(crate_version!())
-                        .push(" connected to voice channel ")
-                        .mention(&voice_channel)
-                        .build();
-
-                    if let Err(e) = metadata_channel.say(
-                        self.cache_http.http(),
-                        msg
-                    ).await {
-                        warn!(
-                            "Failed to post initialization message to Discord: {}",
-                            e
-                        );
-                    }
-                },
-                Err(e) => {
-                    warn!(
-                        "Could not post initialization message to Discord due \
-                         to failure to look up voice channel metadata: {}",
-                        e
-                    );
-                }
-            }
-        }
-
-        self.call.lock().await.play_only_source(Input::new(
-            true,
-            Reader::Extension(stream.into_media_source()),
-            Codec::FloatPcm,
-            Container::Raw,
-            None
-        ))
-    }
-
-    /// Main monitor loop for the Discord client once it has been fully
-    /// initialized. Returns `Err(DiscordError)` if the client exits abnormally.
-    async fn until_shutdown(
-        &mut self,
+        stream: I,
         mut shutdown_rx: WatchReceiver<bool>
-    ) -> Result<(), DiscordError> {
-        loop {
+    )
+    where
+        I: Read + Borrow<S> + Send + 'static,
+        S: AudioStream + 'static
+    {
+        let mut stream = Lessor::new(stream);
+        let mut playback: Option<TrackHandle> = None;
+        let mut runtime_err: Result<(), DiscordError> = Ok(());
+
+        self.channels.hello(&self.cache_http).await;
+
+        //Main consumer event loop
+        while runtime_err.is_ok() {
             tokio::select! {
                 //The client task shouldn't exit on its own, but handle it in
                 //case it does
                 client_crash = &mut self.client_task, if !self.client_task.is_finished() => {
                     match client_crash {
-                        Err(e) => return Err(e.into()),
-                        Ok(Err(e)) => return Err(e.into()),
+                        Err(e) => runtime_err = Err(e.into()),
+                        Ok(Err(e)) => runtime_err = Err(e.into()),
                         Ok(Ok(_)) => warn!(
-                            "Discord client background handler task unexpectedly quit without error"
+                            "Discord client background handler task \
+                             unexpectedly quit without error"
                         ),
                     }
                 },
-                shutdown_changed = shutdown_rx.changed() => if shutdown_changed.is_err() || !*shutdown_rx.borrow() {
-                    return Ok(());
+                shutdown_changed = shutdown_rx.changed() => {
+                    if shutdown_changed.is_err() || !*shutdown_rx.borrow() {
+                        break;
+                    }
+                },
+                new_playback = monitor_playback(
+                    &mut stream,
+                    &self.call,
+                    playback.as_ref()
+                ) => {
+                    playback = new_playback;
                 }
             }
+        }
+
+        //Tear down the connection
+        self.cleanup(playback);
+
+        //If the shutdown condition is an error, then panic the thread to cause
+        //the rest of the application to shut down
+        if let Err(e) = runtime_err {
+            panic!("Discord client crashed: {}", e);
         }
     }
 
     /// Terminates any playing audio and posts a disconnect message to the
     /// configured metadata channel (if any).
-    async fn cleanup(&mut self, track: TrackHandle) {
+    async fn cleanup(mut self, playback: Option<TrackHandle>) {
         //Stop playing audio and disconnect from the voice chat
-        if let Err(e) = track.stop() {
-            warn!("Failed to gracefully stop audio playback: {}", e);
+        if let Some(playback) = playback {
+            stop_playback(&playback);
         }
 
         if let Err(e) = self.call.lock().await.leave().await {
@@ -251,20 +223,15 @@ impl ConnectedClient {
         }
 
         //Post a message that the application is disconnecting
-        if let Some(metadata_channel) = self.channels.metadata {
-            if let Err(e) = metadata_channel.say(
-                self.cache_http.http(),
-                format!("{} disconnected", crate_name!())
-            ).await {
-                warn!("failed to post disconnect message to Discord: {}", e);
-            }
-        }
+        self.channels.goodbye(self.cache_http.http());
 
         //Shut down the client handler thread, if it is still running
         if let Some(client_tx) = mem::take(&mut self.client_tx) {
             if !self.client_task.is_finished() {
                 if client_tx.send(()).is_err() {
-                    warn!("Client task dropped shutdown channel but is still running");
+                    warn!("Client task still running after dropping shutdown \
+                          channel, it will be forcibly aborted");
+                    self.client_task.abort();
                 } else {
                     match (&mut self.client_task).await {
                         Err(e) => if e.is_panic() {
@@ -303,11 +270,12 @@ impl Drop for ConnectedClient {
 // PUBLIC INTERFACE FUNCTIONS **************************************************
 /// Connects to Discord using the provided config and begins playing audio into
 /// the configured voice chat until shutdown.
-pub async fn send_audio<'a>(
-    stream: Box<dyn AudioStream>,
-    cfg: &'a DiscordConfig,
+pub async fn send_audio<I: Read + Borrow<impl AudioStream + 'static> + Send + 'static>(
+    stream: I,
+    cfg: &DiscordConfig,
     shutdown_rx: WatchReceiver<bool>
-) -> Result<JoinHandle<()>, DiscordError> {
+) -> Result<JoinHandle<()>, DiscordError>
+{
     Ok(tokio::spawn(ConnectedClient::new(cfg).await?.run(stream, shutdown_rx)))
 }
 
@@ -401,4 +369,60 @@ fn enumerate_guilds<'a>(
             }
         }
     ).try_flatten_iters()
+}
+
+fn stop_playback(playback: &TrackHandle) {
+    if let Err(e) = playback.stop() {
+        warn!("Failed to gracefully stop audio playback: {}", e);
+    }
+}
+
+async fn monitor_playback<I, S>(
+    stream: &mut Lessor<I>,
+    call: &Arc<Mutex<Call>>,
+    playback: Option<&TrackHandle>
+) -> Option<TrackHandle>
+where
+    I: Read + Borrow<S> + Send + 'static,
+    S: AudioStream
+{
+    /*
+     * It is safe to hold a leased stream across an await point, since a
+     * cancelled future from this function will result in the lease being
+     * dropped, and the value being returned to the lessor.
+     *
+     * (This does require an extra call to this function to reclaim the value)
+     */
+    if let Some(stream_lease) = stream.lease() {
+        //Wait for data to be written to the stream
+        (*stream_lease).borrow().await_samples().await;
+
+        //Start playback
+        Some(call.lock().await.play_only_source(Input::new(
+            true,
+            Reader::Extension(stream_lease),
+            Codec::FloatPcm,
+            Container::Raw,
+            None
+        )))
+    } else {
+        //Wait for playback to terminate naturally, and reclaim the stream
+        stream.await_release().await;
+
+        //Make sure the track has stopped
+        if let Some(playback) = playback {
+            match playback.get_info().await {
+                Ok(state) => if !state.playing.is_done() {
+                    stop_playback(playback)
+                },
+                Err(TrackError::Finished) => {},
+                Err(e) => error!(
+                    "Encountered unexpected error when checking playback status: {}",
+                    e
+                ),
+            }
+        }
+
+        None
+    }
 }

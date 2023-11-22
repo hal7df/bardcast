@@ -205,7 +205,10 @@ fn start(
                     SelectedConsumer::Discord => {
                         let mut tasks = TaskSetBuilder::new();
                         let send_audio_result = discord::send_audio(
-                            stream,
+                            AsyncReadAdapter::new(
+                                stream,
+                                config.stream_timeout
+                            ),
                             &config.discord,
                             shutdown_rx
                         ).await;

@@ -37,11 +37,15 @@ struct WavWriteState<I> {
 // PUBLIC INTERFACE FUNCTIONS **************************************************
 /// Starts recording the given stream to a new file named according to
 /// `output_file`. If `output_file` is `-`, this will write to standard output.
-pub async fn record<I: Read + Borrow<impl AudioStream + 'static> + Send + 'static>(
+pub async fn record<I, S>(
     output_file: &str,
     input: I,
     shutdown_rx: Receiver<bool>
-) -> Result<JoinHandle<()>, IoError> {
+) -> Result<JoinHandle<()>, IoError>
+where
+    I: Read + Borrow<S> + Send + 'static,
+    S: AudioStream + 'static
+{
     let output = BufWriter::new(
         AsyncFile::create(output_file).await?.into_std().await
     );
@@ -195,11 +199,15 @@ fn stream_to_wav<I: Read>(
 
 /// Monitors the recording process, idling and restarting the write task as
 /// necessary.
-async fn record_monitor<I: Read + Borrow<impl AudioStream> + Send + 'static>(
+async fn record_monitor<I, S>(
     writer: RandomAccessWavWriter<f32>,
     input: I,
     mut shutdown_rx: Receiver<bool>
-) {
+)
+where
+    I: Read + Borrow<S> + Send + 'static,
+    S: AudioStream
+{
     let mut state = Some(WavWriteState {
         writer,
         input,
