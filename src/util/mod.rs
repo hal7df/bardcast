@@ -22,7 +22,6 @@ use tokio::sync::watch::Receiver as WatchReceiver;
 enum LessorState<T> {
     Owned(T),
     Leased(OneshotReceiver<T>),
-    Processing
 }
 
 /// Mechanism for sharing ownership over a value without using any form of
@@ -66,21 +65,18 @@ impl<T> LessorState<T> {
     ///
     /// Panics if the lease dropped the return channel without sending the
     /// value.
-    async fn await_release(self) -> Self {
+    async fn await_release(&mut self) -> Option<T> {
         match self {
             Self::Leased(rx) => {
                 if let Ok(value) = rx.await {
-                    Self::Owned(value)
+                    Some(value)
                 } else {
                     panic!("Leased value went out of scope without releasing");
                 }
             },
-            state => {
-                debug!(
-                    "Attempted to await release on a value that was not \
-                     leased, or while the Lessor was processing"
-                );
-                state
+            _ => {
+                debug!("Attempted to await release on an owned value");
+                None
             }
         }
     }
@@ -88,19 +84,19 @@ impl<T> LessorState<T> {
 
 impl<T> Lessor<T> {
     /// Creates a new Lessor responsible for the given value.
-    fn new(value: T) -> Self {
+    pub fn new(value: T) -> Self {
         Self(LessorState::Owned(value))
     }
 
     /// Returns true if the value controlled by the `Lessor` is currently
     /// leased.
-    fn is_leased(&self) -> bool {
+    pub fn is_leased(&self) -> bool {
         !self.0.is_leased()
     }
 
     /// Takes an immutable reference to the controlled value, if currently
     /// owned by the `Lessor1.
-    fn as_ref(&self) -> Option<&T> {
+    pub fn as_ref(&self) -> Option<&T> {
         if let LessorState::Owned(value) = &self.0 {
             Some(value)
         } else {
@@ -110,7 +106,7 @@ impl<T> Lessor<T> {
 
     /// Takes a mutable reference to the controlled value, if currently owned
     /// by the `Lessor`.
-    fn as_mut(&mut self) -> Option<&mut T> {
+    pub fn as_mut(&mut self) -> Option<&mut T> {
         if let LessorState::Owned(value) = &mut self.0 {
             Some(value)
         } else {
@@ -121,7 +117,7 @@ impl<T> Lessor<T> {
     /// Consumes this `Lessor`, returning the raw owned value if it is currently
     /// owned. If the value is currently leased, this will return `None` and
     /// the value will be dropped when the current lease is dropped.
-    fn take(self) -> Option<T> {
+    pub fn take(self) -> Option<T> {
         self.0.take().ok()
     }
 
@@ -131,12 +127,11 @@ impl<T> Lessor<T> {
     ///
     /// Once called, [`Lessor::await_release()`] must be called for the `Lessor`
     /// to regain ownership of the controlled value.
-    fn lease(&mut self) -> Option<Lease<T>> {
-        match mem::replace(&mut self.0, LessorState::Processing).take() {
-            Ok(value) => {
-                let (tx, rx) = oneshot::channel::<T>();
-                self.0 = LessorState::Leased(rx);
+    pub fn lease(&mut self) -> Option<Lease<T>> {
+        let (tx, rx) = oneshot::channel::<T>();
 
+        match mem::replace(&mut self.0, LessorState::Leased(rx)).take() {
+            Ok(value) => {
                 Some(Lease {
                     value: ManuallyDrop::new(value),
                     tx,
@@ -151,11 +146,10 @@ impl<T> Lessor<T> {
 
     /// Waits for the active [`Lease`] object to be dropped, and retakes
     /// ownership of the controlled value.
-    async fn await_release(&mut self) {
-        self.0 = mem::replace(
-            &mut self.0,
-            LessorState::Processing
-        ).await_release().await
+    pub async fn await_release(&mut self) {
+        if let Some(value) = self.0.await_release().await {
+            self.0 = LessorState::Owned(value);
+        }
     }
 }
 
