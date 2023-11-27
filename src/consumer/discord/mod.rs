@@ -4,13 +4,12 @@ pub mod cfg;
 mod client;
 pub mod error;
 
-use std::borrow::Borrow;
 use std::cmp;
-use std::io::Read;
+use std::io::{Error as IoError, ErrorKind, Read, Seek, SeekFrom};
 use std::mem;
+use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 
-use clap::{crate_name, crate_version};
 use futures::future::{self, Either, FutureExt, TryFutureExt};
 use futures::stream::{self, Stream, TryStreamExt};
 use log::{error, info, warn};
@@ -20,12 +19,11 @@ use serenity::model::guild::{GuildInfo, PartialGuild};
 use serenity::model::id::{ChannelId, GuildId};
 use serenity::model::user::User;
 use serenity::prelude::SerenityError;
-use serenity::utils::MessageBuilder;
 use songbird::{Call, Songbird};
 use songbird::error::TrackError;
 use songbird::input::{Container, Input};
 use songbird::input::codec::Codec;
-use songbird::input::reader::Reader;
+use songbird::input::reader::{MediaSource, Reader};
 use songbird::tracks::TrackHandle;
 use stream_flatten_iters::TryStreamExt as _;
 use tokio::sync::Mutex;
@@ -33,7 +31,7 @@ use tokio::sync::oneshot::{self, Sender as OneshotSender};
 use tokio::sync::watch::Receiver as WatchReceiver;
 use tokio::task::JoinHandle;
 
-use crate::snd::AudioStream;
+use crate::snd::StreamNotifier;
 use crate::util::Lessor;
 use crate::util::fmt as fmt_util;
 use self::cfg::DiscordConfig;
@@ -78,6 +76,9 @@ struct ConnectedClient {
     /// A handle for making API calls to Discord.
     cache_http: Arc<CacheAndHttp>,
 }
+
+/// Adapter type for implementing MediaSource on existing Read types.
+struct MediaSourceAdapter<R>(R);
 
 // TYPE IMPLS ******************************************************************
 impl ConnectedClient {
@@ -155,15 +156,11 @@ impl ConnectedClient {
 
     /// Entry point for the main Discord client logic. Panics if the client
     /// exits abnormally.
-    async fn run<I, S>(
+    async fn run<S: Read + StreamNotifier + Send + Sync + 'static>(
         mut self,
-        stream: I,
+        stream: S,
         mut shutdown_rx: WatchReceiver<bool>
-    )
-    where
-        I: Read + Borrow<S> + Send + 'static,
-        S: AudioStream + 'static
-    {
+    ) {
         let mut stream = Lessor::new(stream);
         let mut playback: Option<TrackHandle> = None;
         let mut runtime_err: Result<(), DiscordError> = Ok(());
@@ -259,6 +256,46 @@ impl From<GuildEnumerationState> for Option<GuildPagination> {
     }
 }
 
+impl<R> From<R> for MediaSourceAdapter<R>
+where
+    R: DerefMut + Send + Sync,
+    <R as Deref>::Target: Read
+{
+    fn from(stream: R) -> Self {
+        MediaSourceAdapter(stream)
+    }
+}
+
+impl<R> Seek for MediaSourceAdapter<R> {
+    fn seek(&mut self, _: SeekFrom) -> Result<u64, IoError> {
+        Err(IoError::from(ErrorKind::Unsupported))
+    }
+}
+
+impl<R> Read for MediaSourceAdapter<R>
+where
+    R: DerefMut + Send + Sync,
+    <R as Deref>::Target: Read
+{
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize, IoError> {
+        (*self.0).read(buf)
+    }
+}
+
+impl<R> MediaSource for MediaSourceAdapter<R>
+where
+    R: DerefMut + Send + Sync,
+    <R as Deref>::Target: Read
+{
+    fn is_seekable(&self) -> bool {
+        false
+    }
+
+    fn byte_len(&self) -> Option<u64> {
+        None
+    }
+}
+
 impl Drop for ConnectedClient {
     fn drop(&mut self) {
         if !self.client_task.is_finished() {
@@ -270,71 +307,68 @@ impl Drop for ConnectedClient {
 // PUBLIC INTERFACE FUNCTIONS **************************************************
 /// Connects to Discord using the provided config and begins playing audio into
 /// the configured voice chat until shutdown.
-pub async fn send_audio<I: Read + Borrow<impl AudioStream + 'static> + Send + 'static>(
-    stream: I,
+pub async fn send_audio<S>(
+    stream: S,
     cfg: &DiscordConfig,
     shutdown_rx: WatchReceiver<bool>
 ) -> Result<JoinHandle<()>, DiscordError>
-{
+where S: Read + StreamNotifier + Send + Sync + 'static {
     Ok(tokio::spawn(ConnectedClient::new(cfg).await?.run(stream, shutdown_rx)))
 }
 
 /// Prints a list of Discord servers available to the given bot token, or
 /// returns an error if one is encountered while generating the list of servers.
 pub async fn list_guilds(token: impl AsRef<str>) -> Result<(), SerenityError> {
-    match client::get(token, None, None).await {
-        Ok(client) => {
-            // Fetch a list of basic metadata for all available servers
-            let http = &client.cache_and_http.http;
-            let guild_data = enumerate_guilds(http)
-                .and_then(|guild| http.get_guild(guild.id.0))
-                .and_then(|guild| http
-                    .get_user(guild.owner_id.0)
-                    .map_ok(move |owner| (guild, owner))
-                )
-                .try_collect::<Vec<(PartialGuild, User)>>().await?;
+    let client = client::get(token, None, None).await?;
 
-            if guild_data.is_empty() {
-                info!("No servers were found with the given token. \
-                       Ensure your bot is invited to at least one server.");
-                return Ok(());
-            }
+    // Fetch a list of basic metadata for all available servers
+    let http = &client.cache_and_http.http;
+    let guild_data = enumerate_guilds(http)
+        .and_then(|guild| http.get_guild(guild.id.0))
+        .and_then(|guild| http
+            .get_user(guild.owner_id.0)
+            .map_ok(move |owner| (guild, owner))
+        )
+        .try_collect::<Vec<(PartialGuild, User)>>().await?;
 
-            //Determine the display widths for the first two columns
-            let guild_id_width = cmp::max(
-                GUILD_ID_HEADER.len(),
-                fmt_util::max_display_length(
-                    guild_data.iter().map(|guild_and_owner| guild_and_owner.0.id.0)
-                )
-            );
-            let guild_name_width = cmp::max(
-                GUILD_NAME_HEADER.len(),
-                fmt_util::max_display_length(
-                    guild_data.iter().map(|guild_and_owner| &guild_and_owner.0.name)
-                )
-            );
-
-            //Print out the metadata
-            println!(
-                "{: <guild_id_width$}\t{: <guild_name_width$}\t{}",
-                GUILD_ID_HEADER,
-                GUILD_NAME_HEADER,
-                OWNER_HEADER
-            );
-            for (guild, owner) in guild_data {
-                println!(
-                    "{: <guild_id_width$}\t{: <guild_name_width$}\t{}#{:0>4}",
-                    guild.id.0,
-                    guild.name,
-                    owner.name,
-                    owner.discriminator
-                );
-            }
-
-            Ok(())
-        },
-        Err(e) => Err(e),
+    if guild_data.is_empty() {
+        info!("No servers were found with the given token. \
+               Ensure your bot is invited to at least one server.");
+        return Ok(());
     }
+
+    //Determine the display widths for the first two columns
+    let guild_id_width = cmp::max(
+        GUILD_ID_HEADER.len(),
+        fmt_util::max_display_length(
+            guild_data.iter().map(|guild_and_owner| guild_and_owner.0.id.0)
+        )
+    );
+    let guild_name_width = cmp::max(
+        GUILD_NAME_HEADER.len(),
+        fmt_util::max_display_length(
+            guild_data.iter().map(|guild_and_owner| &guild_and_owner.0.name)
+        )
+    );
+
+    //Print out the metadata
+    println!(
+        "{: <guild_id_width$}\t{: <guild_name_width$}\t{}",
+        GUILD_ID_HEADER,
+        GUILD_NAME_HEADER,
+        OWNER_HEADER
+    );
+    for (guild, owner) in guild_data {
+        println!(
+            "{: <guild_id_width$}\t{: <guild_name_width$}\t{}#{:0>4}",
+            guild.id.0,
+            guild.name,
+            owner.name,
+            owner.discriminator
+        );
+    }
+
+    Ok(())
 }
 
 // HELPER FUNCTIONS ************************************************************
@@ -377,15 +411,12 @@ fn stop_playback(playback: &TrackHandle) {
     }
 }
 
-async fn monitor_playback<I, S>(
-    stream: &mut Lessor<I>,
+async fn monitor_playback<S>(
+    stream: &mut Lessor<S>,
     call: &Arc<Mutex<Call>>,
     playback: Option<&TrackHandle>
 ) -> Option<TrackHandle>
-where
-    I: Read + Borrow<S> + Send + 'static,
-    S: AudioStream
-{
+where S: Read + StreamNotifier + Send + Sync + 'static {
     /*
      * It is safe to hold a leased stream across an await point, since a
      * cancelled future from this function will result in the lease being
@@ -394,13 +425,13 @@ where
      * (This does require an extra call to this function to reclaim the value)
      */
     if let Some(stream_lease) = stream.lease() {
-        //Wait for data to be written to the stream
-        (*stream_lease).borrow().await_samples().await;
+        //Wait for data to be written the stream
+        stream_lease.await_samples().await;
 
         //Start playback
         Some(call.lock().await.play_only_source(Input::new(
             true,
-            Reader::Extension(stream_lease),
+            Reader::Extension(Box::new(MediaSourceAdapter::from(stream_lease))),
             Codec::FloatPcm,
             Container::Raw,
             None
@@ -413,7 +444,7 @@ where
         if let Some(playback) = playback {
             match playback.get_info().await {
                 Ok(state) => if !state.playing.is_done() {
-                    stop_playback(playback)
+                    stop_playback(playback);
                 },
                 Err(TrackError::Finished) => {},
                 Err(e) => error!(

@@ -40,7 +40,7 @@ use self::event::{
 use self::event::factory::EventListenerFactory;
 use self::error::{ComponentError, PulseDriverError};
 use self::owned::{OwnedSinkInfo, OwnedSinkInputInfo};
-use super::{Driver, DriverInitError};
+use super::types::{Driver, DriverInitError};
 
 pub use self::cfg::PulseDriverConfig;
 

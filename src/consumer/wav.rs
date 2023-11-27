@@ -21,7 +21,7 @@ use wave_stream::samples_by_channel::SamplesByChannel;
 use wave_stream::wave_header::{Channels, SampleFormat, WavHeader};
 use wave_stream::wave_writer::RandomAccessWavWriter;
 
-use crate::snd::AudioStream;
+use crate::snd::StreamNotifier;
 use crate::util;
 
 const SAMPLE_RATE: u32 = 48000;
@@ -44,7 +44,7 @@ pub async fn record<I, S>(
 ) -> Result<JoinHandle<()>, IoError>
 where
     I: Read + Borrow<S> + Send + 'static,
-    S: AudioStream + 'static
+    S: StreamNotifier + 'static
 {
     let output = BufWriter::new(
         AsyncFile::create(output_file).await?.into_std().await
@@ -82,7 +82,7 @@ const fn max_recording_len() -> Duration {
 ///   2. A shutdown signal is sent.
 async fn should_continue_output(
     shutdown_rx: &mut Receiver<bool>,
-    stream: &impl AudioStream
+    stream: &impl StreamNotifier
 ) -> bool {
     tokio::select! {
         biased;
@@ -206,7 +206,7 @@ async fn record_monitor<I, S>(
 )
 where
     I: Read + Borrow<S> + Send + 'static,
-    S: AudioStream
+    S: StreamNotifier
 {
     let mut state = Some(WavWriteState {
         writer,

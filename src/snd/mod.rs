@@ -24,24 +24,19 @@
 ///! users to compile the application without support for the driver if they so
 ///! choose.
 
+mod types;
+
 #[cfg(all(target_family = "unix", feature = "pulse"))]
 pub mod pulse;
 
-use std::error::Error;
-use std::fmt::{Display, Error as FormatError, Formatter};
 use std::mem;
-use std::pin::Pin;
 
-use async_ringbuf::consumer::AsyncConsumer;
-use async_ringbuf::ring_buffer::AsyncRbRead;
-use async_trait::async_trait;
-use futures::io::AsyncRead;
 use log::{debug, info};
-use ringbuf::ring_buffer::RbRef;
 use tokio::sync::watch::Receiver;
 
 use crate::cfg::ApplicationConfig;
-use crate::util::task::TaskContainer;
+
+pub use self::types::{StreamNotifier, Driver, DriverStartError};
 
 /// List of all sound drivers compiled in the application. When not specified,
 /// the first driver with an available backend is selected.
@@ -53,164 +48,7 @@ const DRIVERS: &'static [&'static str] = &[
 /// The size of a stereo IEEE 754 32-bit floating point audio sample.
 const F32LE_STEREO_SAMPLE_SIZE: usize = mem::size_of::<f32>() * 2;
 
-// TYPE DEFINITIONS ************************************************************
-
-/// Extension trait to AsyncRead that enables an audio stream reader to
-/// non-destructively detect when data is written to the stream. This stream
-/// should contain IEEE 754 32-bit float stereo audio samples (where the left
-/// audio sample comes before the right) at a sample rate of 48kHz, encoded as
-/// bytes.
-#[async_trait]
-pub trait AudioStream: AsyncRead + Send + Sync {
-    /// Waits for at least one stereo audio sample to be written to the stream,
-    /// signaling for playback to resume if it has stopped due to a lack of
-    /// data.
-    async fn await_samples(&self);
-}
-
-/// Wrapper struct for the two functional components of an audio driver: its
-/// stream and any tasks it needs to stay alive.
-pub struct Driver {
-    stream: Pin<Box<dyn AudioStream>>,
-    driver_tasks: Box<dyn TaskContainer<()>>,
-}
-
-/// High-level representation of errors that can occur during the process of
-/// starting/initializing a sound driver.
-#[derive(Debug)]
-pub enum DriverStartError {
-    /// The sound driver failed to connect to its backend. The underlying error
-    /// object is wrapped as a trait object.
-    ConnectionError(Box<dyn Error>),
-
-    /// The sound driver encountered an internal error while initializing. The
-    /// underlying error object is wrapped as a trait object.
-    InitializationError(Box<dyn Error>),
-
-    /// The application failed to automatically find a suitable sound driver.
-    NoAvailableBackends,
-
-    /// The user-requeted sound driver does not exist, with the requested sound
-    /// driver provided as a string.
-    UnknownDriver(String),
-}
-
-/// Internal specialization of errors thrown specifically by sound drivers
-/// during initialization.
-#[derive(Debug)]
-enum DriverInitError<E> {
-    /// The sound driver failed to connect to its backend, with a
-    /// driver-provided error type providing details.
-    ///
-    /// When a driver returns this error during driver autoselection, the
-    /// application will attempt to startthe next configured sound driver, if
-    /// any.
-    ConnectionError(E),
-
-    /// The sound driver encountered an internal error while initializing, but
-    /// was otherwise able to communicate with its backend. A driver-provided
-    /// error type carries the details of the failure.
-    ///
-    /// When a driver returns this error during driver autoselection, the
-    /// application will shut down without attempting to start any other sound
-    /// drivers.
-    InitializationError(E),
-}
-
-// TYPE IMPLS ******************************************************************
-impl Driver {
-    /// Creates a new instance from the given stream and set of tasks.
-    fn new<S, T>(stream: S, tasks: T) -> Self
-    where S: AudioStream + 'static,
-          T: TaskContainer<()> + 'static {
-        Self {
-            stream: Box::pin(stream),
-            driver_tasks: Box::new(tasks),
-        }
-    }
-
-    /// Consumes this driver into its constituent parts.
-    pub fn into_tuple(self) -> (Pin<Box<dyn AudioStream>>, Box<dyn TaskContainer<()>>) {
-        (self.stream, self.driver_tasks)
-    }
-}
-
-// TRAIT IMPLS *****************************************************************
-#[async_trait]
-impl<R: RbRef + Send + Sync + 'static> AudioStream for AsyncConsumer<u8, R>
-where <R as RbRef>::Rb: AsyncRbRead<u8> {
-    async fn await_samples(&self) {
-        self.wait(F32LE_STEREO_SAMPLE_SIZE).await;
-    }
-}
-
-impl Display for DriverStartError {
-    fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), FormatError> {
-        match self {
-            DriverStartError::ConnectionError(e) => write!(
-                f,
-                "Sound driver failed to connect to backend: {}",
-                e
-            ),
-            DriverStartError::InitializationError(e) => write!(
-                f,
-                "Sound driver failed to initialize: {}",
-                e
-            ),
-            DriverStartError::NoAvailableBackends => write!(
-                f,
-                "No audio backends available"
-            ),
-            DriverStartError::UnknownDriver(name) => write!(
-                f,
-                "No such sound driver '{}'",
-                name
-            ),
-        }
-    }
-}
-
-impl<E: Display> Display for DriverInitError<E> {
-    fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), FormatError> {
-        match self {
-            DriverInitError::ConnectionError(e) => write!(
-                f,
-                "Sound driver failed to connect to backend: {}",
-                e
-            ),
-            DriverInitError::InitializationError(e) => write!(
-                f,
-                "Sound driver failed to initialize: {}",
-                e
-            ),
-        }
-    }
-}
-
-impl Error for DriverStartError {}
-
-impl<E: Error + 'static> Error for DriverInitError<E> {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        Some(match self {
-            DriverInitError::ConnectionError(e) => e,
-            DriverInitError::InitializationError(e) => e,
-        })
-    }
-}
-
-impl<E: Error + 'static> From<DriverInitError<E>> for DriverStartError {
-    fn from(init_error: DriverInitError<E>) -> Self {
-        match init_error {
-            DriverInitError::ConnectionError(e) =>
-                DriverStartError::ConnectionError(Box::new(e)),
-            DriverInitError::InitializationError(e) =>
-                DriverStartError::InitializationError(Box::new(e)),
-        }
-    }
-}
-
 // PUBLIC INTERFACE FUNCTIONS **************************************************
-
 /// Selects the appropriate sound driver based on the provided configuration and
 /// starts it, if possible. If a sound driver is not explicitly specified by the
 /// user, this will select the first availble sound driver and start it,
@@ -237,7 +75,6 @@ pub fn list_drivers() {
 }
 
 // HELPER FUNCTIONS ************************************************************
-
 /// Attempts to start the driver with the given name.
 async fn start_driver(
     driver_name: &str,

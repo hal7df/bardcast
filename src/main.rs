@@ -200,7 +200,7 @@ fn start(
 
         match driver {
             Ok(driver) => {
-                let (stream, driver_tasks) = driver.into_tuple();
+                let (stream, driver_tasks) = driver.as_async_read();
                 let stream_tasks: Result<Box<dyn TaskContainer<()>>, String> = match consumer {
                     SelectedConsumer::Discord => {
                         let mut tasks = TaskSetBuilder::new();

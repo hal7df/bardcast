@@ -1,0 +1,278 @@
+///! Common types used within and exposed by the snd module.
+
+use std::borrow::{Borrow, BorrowMut};
+use std::error::Error;
+use std::fmt::{Display, Error as FormatError, Formatter};
+use std::io::{Error as IoError, ErrorKind, Read};
+use std::time::Duration;
+
+use async_ringbuf::consumer::AsyncConsumer;
+use async_ringbuf::ring_buffer::AsyncRbRead;
+use async_trait::async_trait;
+use futures::executor;
+use futures::future::{self, Either};
+use futures::io::{AsyncRead, AsyncReadExt};
+use ringbuf::ring_buffer::RbRef;
+
+use crate::util::task::TaskContainer;
+
+const DEFAULT_ASYNC_READ_TIMEOUT: Duration = Duration::from_millis(250u64);
+
+// TYPE DEFINITIONS ************************************************************
+/// Extension trait to AsyncRead that enables an audio stream reader to
+/// non-destructively detect when data is written to the stream. This stream
+/// should contain IEEE 754 32-bit float stereo audio samples (where the left
+/// audio sample comes before the right) at a sample rate of 48kHz, encoded as
+/// bytes.
+#[async_trait]
+pub trait StreamNotifier {
+    /// Waits for at least one stereo audio sample to be written to the stream,
+    /// signaling for playback to resume if it has stopped due to a lack of
+    /// data.
+    async fn await_samples(&self);
+}
+
+pub trait AsyncAudioStream: AsyncRead + StreamNotifier + Unpin {}
+
+pub trait SyncAudioStream: Read + StreamNotifier {}
+
+/// Base trait for types that can be converted into readable audio streams.
+pub trait AudioStream {
+    /// Consumes this `AudioStream` and produces an opaque [`SyncAudioStream`]
+    /// implementation.
+    ///
+    /// Audio streams that are inherently asynchronous may accomplish this by
+    /// using a timed 
+    fn into_sync_stream(
+        self,
+        read_timeout: Option<Duration>
+    ) -> Box<dyn SyncAudioStream + Sync>;
+
+    /// Consumes this `AudioStream` and produces an opaque [`AsyncAudioStream`]
+    /// implementation.
+    fn into_async_stream(self) -> Box<dyn AsyncAudioStream + Sync>;
+}
+
+/// Adapter to use a type implementing [`AsyncRead`] in a context where a
+/// blocking [`Read`] is required, with a configurable read timeout.
+pub struct SyncStreamAdapter<A> {
+    reader: A,
+    async_timeout: Duration,
+}
+
+/// Wrapper struct for the two functional components of an audio driver: its
+/// stream and any tasks it needs to stay alive.
+pub struct Driver {
+    stream: Box<dyn AudioStream + Sync>,
+    driver_tasks: Box<dyn TaskContainer<()>>,
+}
+
+/// High-level representation of errors that can occur during the process of
+/// starting/initializing a sound driver.
+#[derive(Debug)]
+pub enum DriverStartError {
+    /// The sound driver failed to connect to its backend. The underlying error
+    /// object is wrapped as a trait object.
+    ConnectionError(Box<dyn Error>),
+
+    /// The sound driver encountered an internal error while initializing. The
+    /// underlying error object is wrapped as a trait object.
+    InitializationError(Box<dyn Error>),
+
+    /// The application failed to automatically find a suitable sound driver.
+    NoAvailableBackends,
+
+    /// The user-requeted sound driver does not exist, with the requested sound
+    /// driver provided as a string.
+    UnknownDriver(String),
+}
+
+/// Internal specialization of errors thrown specifically by sound drivers
+/// during initialization.
+#[derive(Debug)]
+pub enum DriverInitError<E> {
+    /// The sound driver failed to connect to its backend, with a
+    /// driver-provided error type providing details.
+    ///
+    /// When a driver returns this error during driver autoselection, the
+    /// application will attempt to startthe next configured sound driver, if
+    /// any.
+    ConnectionError(E),
+
+    /// The sound driver encountered an internal error while initializing, but
+    /// was otherwise able to communicate with its backend. A driver-provided
+    /// error type carries the details of the failure.
+    ///
+    /// When a driver returns this error during driver autoselection, the
+    /// application will shut down without attempting to start any other sound
+    /// drivers.
+    InitializationError(E),
+}
+
+// TYPE IMPLS ******************************************************************
+impl Driver {
+    /// Creates a new instance from the given stream and set of tasks.
+    pub fn new<S, T>(stream: S, tasks: T) -> Self
+    where S: AudioStream + StreamNotifier + Sync + 'static,
+          T: TaskContainer<()> + 'static
+    {
+        Self {
+            stream: Box::new(stream),
+            driver_tasks: Box::new(tasks),
+        }
+    }
+
+    /// Consumes this driver into its constituent parts.
+    pub fn as_async_read(self) -> (Box<dyn AsyncAudioStream + Sync>, Box<dyn TaskContainer<()>>) {
+        (self.stream.into_async_stream(), self.driver_tasks)
+    }
+
+    pub fn as_sync_read(
+        self,
+        read_timeout: Option<Duration>
+    ) -> (Box<dyn SyncAudioStream + Sync>, Box<dyn TaskContainer<()>>) {
+        (self.stream.into_sync_stream(read_timeout), self.driver_tasks)
+    }
+}
+
+impl<A: AsyncRead + Unpin> SyncStreamAdapter<A> {
+    /// Creates a new `AsyncReadAdapter` from the given [`AsyncRead`]
+    /// implementor, and read timeout. If no timeout is given, a timeout of a
+    /// quarter second (250ms) is used.
+    pub fn new(reader: A, async_timeout: Option<Duration>) -> Self {
+        Self {
+            reader,
+            async_timeout: async_timeout.unwrap_or(DEFAULT_ASYNC_READ_TIMEOUT),
+        }
+    }
+}
+
+// TRAIT IMPLS *****************************************************************
+impl<A: AsyncRead + StreamNotifier + Unpin> AsyncAudioStream for A {}
+
+impl<R: Read + StreamNotifier> SyncAudioStream for R {}
+
+#[async_trait]
+impl<R: RbRef + Sync + 'static> StreamNotifier for AsyncConsumer<u8, R>
+where <R as RbRef>::Rb: AsyncRbRead<u8> {
+    async fn await_samples(&self) {
+        self.wait(super::F32LE_STEREO_SAMPLE_SIZE).await;
+    }
+}
+
+impl<R: RbRef + Sync + 'static> AudioStream for AsyncConsumer<u8, R>
+where <R as RbRef>::Rb: AsyncRbRead<u8> {
+    fn into_sync_stream(
+        self,
+        read_timeout: Option<Duration>
+    ) -> Box<dyn SyncAudioStream + Sync> {
+        Box::new(SyncStreamAdapter::new(self, read_timeout))
+    }
+
+    fn into_async_stream(self) -> Box<dyn AsyncAudioStream + Sync> {
+        Box::new(self)
+    }
+}
+
+#[async_trait]
+impl<A: StreamNotifier + Sync> StreamNotifier for SyncStreamAdapter<A> {
+    async fn await_samples(&self) {
+        self.reader.await_samples();
+    }
+}
+
+impl<A> Borrow<A> for SyncStreamAdapter<A> {
+    fn borrow(&self) -> &A {
+        &self.reader
+    }
+}
+
+impl<A> BorrowMut<A> for SyncStreamAdapter<A> {
+    fn borrow_mut(&mut self) -> &mut A {
+        &mut self.reader
+    }
+}
+
+impl<A: AsyncRead + Unpin> Read for SyncStreamAdapter<A> {
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize, IoError> {
+        executor::block_on(async {
+            let timeout = tokio::time::sleep(self.async_timeout);
+            tokio::pin!(timeout);
+
+            let timed_read_res = future::select(
+                self.reader.read(buf),
+                timeout
+            ).await;
+
+            match timed_read_res {
+                Either::Left((res, _)) => res,
+                Either::Right(_) => Err(IoError::from(ErrorKind::TimedOut)),
+            }
+        })
+    }
+}
+
+impl Display for DriverStartError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), FormatError> {
+        match self {
+            DriverStartError::ConnectionError(e) => write!(
+                f,
+                "Sound driver failed to connect to backend: {}",
+                e
+            ),
+            DriverStartError::InitializationError(e) => write!(
+                f,
+                "Sound driver failed to initialize: {}",
+                e
+            ),
+            DriverStartError::NoAvailableBackends => write!(
+                f,
+                "No audio backends available"
+            ),
+            DriverStartError::UnknownDriver(name) => write!(
+                f,
+                "No such sound driver '{}'",
+                name
+            ),
+        }
+    }
+}
+
+impl<E: Display> Display for DriverInitError<E> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), FormatError> {
+        match self {
+            DriverInitError::ConnectionError(e) => write!(
+                f,
+                "Sound driver failed to connect to backend: {}",
+                e
+            ),
+            DriverInitError::InitializationError(e) => write!(
+                f,
+                "Sound driver failed to initialize: {}",
+                e
+            ),
+        }
+    }
+}
+
+impl Error for DriverStartError {}
+
+impl<E: Error + 'static> Error for DriverInitError<E> {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(match self {
+            DriverInitError::ConnectionError(e) => e,
+            DriverInitError::InitializationError(e) => e,
+        })
+    }
+}
+
+impl<E: Error + 'static> From<DriverInitError<E>> for DriverStartError {
+    fn from(init_error: DriverInitError<E>) -> Self {
+        match init_error {
+            DriverInitError::ConnectionError(e) =>
+                DriverStartError::ConnectionError(Box::new(e)),
+            DriverInitError::InitializationError(e) =>
+                DriverStartError::InitializationError(Box::new(e)),
+        }
+    }
+}
