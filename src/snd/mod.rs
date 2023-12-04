@@ -36,7 +36,14 @@ use tokio::sync::watch::Receiver;
 
 use crate::cfg::ApplicationConfig;
 
-pub use self::types::{StreamNotifier, Driver, DriverStartError};
+pub use self::types::{
+    AsyncAudioStream,
+    AudioStream,
+    StreamNotifier,
+    SyncAudioStream,
+    Driver,
+    DriverStartError
+};
 
 /// List of all sound drivers compiled in the application. When not specified,
 /// the first driver with an available backend is selected.

@@ -5,11 +5,14 @@ mod client;
 pub mod error;
 
 use std::cmp;
+use std::error::Error;
 use std::io::{Error as IoError, ErrorKind, Read, Seek, SeekFrom};
 use std::mem;
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
+use std::time::Duration;
 
+use async_trait::async_trait;
 use futures::future::{self, Either, FutureExt, TryFutureExt};
 use futures::stream::{self, Stream, TryStreamExt};
 use log::{error, info, warn};
@@ -31,12 +34,14 @@ use tokio::sync::oneshot::{self, Sender as OneshotSender};
 use tokio::sync::watch::Receiver as WatchReceiver;
 use tokio::task::JoinHandle;
 
-use crate::snd::StreamNotifier;
+use crate::snd::{AudioStream, StreamNotifier};
 use crate::util::Lessor;
 use crate::util::fmt as fmt_util;
+use crate::util::task::{TaskContainer, TaskSetBuilder};
 use self::cfg::DiscordConfig;
 use self::client::{ChannelResolutionReceiver, Channels};
 use self::error::DiscordError;
+use super::AudioConsumer;
 
 const GUILD_ID_HEADER: &'static str = "Server ID";
 const GUILD_NAME_HEADER: &'static str = "Server Name";
@@ -44,6 +49,8 @@ const OWNER_HEADER: &'static str = "Owner";
 const DEFAULT_FETCH_SIZE: u64 = 100;
 
 // TYPE DEFINITIONS ************************************************************
+/// Discord [`AudioCosumer`] implementation.
+pub struct DiscordConsumer<'a>(&'a DiscordConfig, Option<Duration>);
 
 /// Internal representation of state for a paginated query of Discord servers.
 #[derive(Debug, PartialEq, Eq)]
@@ -81,6 +88,12 @@ struct ConnectedClient {
 struct MediaSourceAdapter<R>(R);
 
 // TYPE IMPLS ******************************************************************
+impl<'a> DiscordConsumer<'a> {
+    fn new(cfg: &'a DiscordConfig, read_timeout: Option<Duration>) -> Self {
+        Self(cfg, read_timeout)
+    }
+}
+
 impl ConnectedClient {
     /// Creates a client from the given config, resolving the configured
     /// channels and connecting to the desired voice chat.
@@ -246,6 +259,24 @@ impl ConnectedClient {
 }
 
 // TRAIT IMPLS *****************************************************************
+#[async_trait]
+impl<'a> AudioConsumer for DiscordConsumer<'a> {
+    async fn start<S: AudioStream + Send + Sync>(
+        self,
+        stream: S,
+        shutdown_rx: WatchReceiver<bool>
+    ) -> Result<Box<dyn TaskContainer<()>>, Box<dyn Error>> {
+        let mut tasks = TaskSetBuilder::new();
+        let client = ConnectedClient::new(self.0).await?;
+
+        tasks.insert(tokio::spawn(client.run(
+            stream.into_sync_stream(self.1),
+            shutdown_rx
+        )));
+        Ok(Box::new(tasks.build()))
+    }
+}
+
 impl From<GuildEnumerationState> for Option<GuildPagination> {
     fn from(state: GuildEnumerationState) -> Self {
         if let GuildEnumerationState::LastGuild(id) = state {

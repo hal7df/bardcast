@@ -32,25 +32,24 @@ pub trait StreamNotifier {
     async fn await_samples(&self);
 }
 
-pub trait AsyncAudioStream: AsyncRead + StreamNotifier + Unpin {}
-
-pub trait SyncAudioStream: Read + StreamNotifier {}
-
 /// Base trait for types that can be converted into readable audio streams.
 pub trait AudioStream {
-    /// Consumes this `AudioStream` and produces an opaque [`SyncAudioStream`]
+    type AsyncImpl: AsyncRead + StreamNotifier + Unpin + Send + Sync + 'static;
+    type SyncImpl: Read + StreamNotifier + Send + Sync + 'static;
+
+    /// Converts this `AudioStream` into a usable Read + StreamNotifier
     /// implementation.
     ///
     /// Audio streams that are inherently asynchronous may accomplish this by
-    /// using a timed 
+    /// using a timeout on the read operation.
     fn into_sync_stream(
         self,
         read_timeout: Option<Duration>
-    ) -> Box<dyn SyncAudioStream + Sync>;
+    ) -> Self::SyncImpl;
 
-    /// Consumes this `AudioStream` and produces an opaque [`AsyncAudioStream`]
+    /// Converts this `AudioStream` into a usable AsyncRead + StreamNotifier
     /// implementation.
-    fn into_async_stream(self) -> Box<dyn AsyncAudioStream + Sync>;
+    fn into_async_stream(self) -> Self::AsyncImpl;
 }
 
 /// Adapter to use a type implementing [`AsyncRead`] in a context where a
@@ -62,8 +61,8 @@ pub struct SyncStreamAdapter<A> {
 
 /// Wrapper struct for the two functional components of an audio driver: its
 /// stream and any tasks it needs to stay alive.
-pub struct Driver {
-    stream: Box<dyn AudioStream + Sync>,
+pub struct Driver<S> {
+    stream: S,
     driver_tasks: Box<dyn TaskContainer<()>>,
 }
 
@@ -110,28 +109,16 @@ pub enum DriverInitError<E> {
 }
 
 // TYPE IMPLS ******************************************************************
-impl Driver {
+impl<S> Driver<S>
+where S: AudioStream + StreamNotifier + Sync + 'static {
     /// Creates a new instance from the given stream and set of tasks.
-    pub fn new<S, T>(stream: S, tasks: T) -> Self
-    where S: AudioStream + StreamNotifier + Sync + 'static,
-          T: TaskContainer<()> + 'static
+    pub fn new<T>(stream: S, tasks: T) -> Self
+    where T: TaskContainer<()> + 'static
     {
         Self {
-            stream: Box::new(stream),
+            stream,
             driver_tasks: Box::new(tasks),
         }
-    }
-
-    /// Consumes this driver into its constituent parts.
-    pub fn as_async_read(self) -> (Box<dyn AsyncAudioStream + Sync>, Box<dyn TaskContainer<()>>) {
-        (self.stream.into_async_stream(), self.driver_tasks)
-    }
-
-    pub fn as_sync_read(
-        self,
-        read_timeout: Option<Duration>
-    ) -> (Box<dyn SyncAudioStream + Sync>, Box<dyn TaskContainer<()>>) {
-        (self.stream.into_sync_stream(read_timeout), self.driver_tasks)
     }
 }
 
@@ -148,10 +135,6 @@ impl<A: AsyncRead + Unpin> SyncStreamAdapter<A> {
 }
 
 // TRAIT IMPLS *****************************************************************
-impl<A: AsyncRead + StreamNotifier + Unpin> AsyncAudioStream for A {}
-
-impl<R: Read + StreamNotifier> SyncAudioStream for R {}
-
 #[async_trait]
 impl<R: RbRef + Sync + 'static> StreamNotifier for AsyncConsumer<u8, R>
 where <R as RbRef>::Rb: AsyncRbRead<u8> {
@@ -162,15 +145,18 @@ where <R as RbRef>::Rb: AsyncRbRead<u8> {
 
 impl<R: RbRef + Sync + 'static> AudioStream for AsyncConsumer<u8, R>
 where <R as RbRef>::Rb: AsyncRbRead<u8> {
+    type AsyncImpl = Self;
+    type SyncImpl = SyncStreamAdapter<Self>;
+
     fn into_sync_stream(
         self,
         read_timeout: Option<Duration>
-    ) -> Box<dyn SyncAudioStream + Sync> {
-        Box::new(SyncStreamAdapter::new(self, read_timeout))
+    ) -> Self::SyncImpl {
+        SyncStreamAdapter::new(self, read_timeout)
     }
 
-    fn into_async_stream(self) -> Box<dyn AsyncAudioStream + Sync> {
-        Box::new(self)
+    fn into_async_stream(self) -> Self::AsyncImpl {
+        self
     }
 }
 
