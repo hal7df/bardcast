@@ -336,17 +336,6 @@ impl Drop for ConnectedClient {
 }
 
 // PUBLIC INTERFACE FUNCTIONS **************************************************
-/// Connects to Discord using the provided config and begins playing audio into
-/// the configured voice chat until shutdown.
-pub async fn send_audio<S>(
-    stream: S,
-    cfg: &DiscordConfig,
-    shutdown_rx: WatchReceiver<bool>
-) -> Result<JoinHandle<()>, DiscordError>
-where S: Read + StreamNotifier + Send + Sync + 'static {
-    Ok(tokio::spawn(ConnectedClient::new(cfg).await?.run(stream, shutdown_rx)))
-}
-
 /// Prints a list of Discord servers available to the given bot token, or
 /// returns an error if one is encountered while generating the list of servers.
 pub async fn list_guilds(token: impl AsRef<str>) -> Result<(), SerenityError> {
