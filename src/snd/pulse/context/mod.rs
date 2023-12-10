@@ -80,9 +80,7 @@ type ContextThunk = Box<dyn FnOnce(&mut Context) + Send + 'static>;
 /// functions against the context serially, allowing other tasks to interact
 /// with PulseAudio from multiple threads.
 #[derive(Clone)]
-pub struct PulseContextWrapper {
-    op_queue: MpscSender<ContextThunk>,
-}
+pub struct PulseContextWrapper(MpscSender<ContextThunk>);
 
 /// Utility type for managing the mainloop.
 ///
@@ -112,7 +110,7 @@ impl PulseContextWrapper {
         );
 
         Ok(ValueJoinHandle::new(
-            Self { op_queue: op_queue_tx },
+            Self(op_queue_tx),
             start_context_handler(
                 server,
                 max_mainloop_interval_usec,
@@ -129,7 +127,7 @@ impl PulseContextWrapper {
     /// operation.
     pub async fn with_ctx<F>(&self, op: F)
     where F: FnOnce(&mut Context) + Send + 'static {
-        if self.op_queue.send(Box::new(op)).await.is_err() {
+        if self.0.send(Box::new(op)).await.is_err() {
             panic!("PulseAudio context handler task unexpectedly terminated");
         }
     }
