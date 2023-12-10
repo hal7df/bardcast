@@ -37,7 +37,7 @@ use tokio::task::JoinHandle;
 use crate::snd::{AudioStream, StreamNotifier};
 use crate::util::Lessor;
 use crate::util::fmt as fmt_util;
-use crate::util::task::{TaskContainer, TaskSetBuilder};
+use crate::util::task::{TaskSet, TaskSetBuilder};
 use self::cfg::DiscordConfig;
 use self::client::{ChannelResolutionReceiver, Channels};
 use self::error::DiscordError;
@@ -89,7 +89,7 @@ struct MediaSourceAdapter<R>(R);
 
 // TYPE IMPLS ******************************************************************
 impl<'a> DiscordConsumer<'a> {
-    fn new(cfg: &'a DiscordConfig, read_timeout: Option<Duration>) -> Self {
+    pub fn new(cfg: &'a DiscordConfig, read_timeout: Option<Duration>) -> Self {
         Self(cfg, read_timeout)
     }
 }
@@ -265,7 +265,7 @@ impl<'a> AudioConsumer for DiscordConsumer<'a> {
         self,
         stream: S,
         shutdown_rx: WatchReceiver<bool>
-    ) -> Result<Box<dyn TaskContainer<()>>, Box<dyn Error>> {
+    ) -> Result<TaskSet<()>, Box<dyn Error>> {
         let mut tasks = TaskSetBuilder::new();
         let client = ConnectedClient::new(self.0).await?;
 
@@ -273,7 +273,7 @@ impl<'a> AudioConsumer for DiscordConsumer<'a> {
             stream.into_sync_stream(self.1),
             shutdown_rx
         )));
-        Ok(Box::new(tasks.build()))
+        Ok(tasks.build())
     }
 }
 

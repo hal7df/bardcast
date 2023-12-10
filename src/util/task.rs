@@ -35,13 +35,13 @@ pub enum ControlledJoinHandle<T> {
 
 /// Wrapper utility that allows for initialization funcions to return both a
 /// value and a [`JoinHandle`] for a task that was spawned during initialization.
-pub struct ValueJoinHandle<T>(T, JoinHandle<()>);
+pub struct ValueJoinHandle<T, R>(T, JoinHandle<R>);
 
 /// Builder for a [`TaskSet`] that consumes externally spawned [`JoinHandle`]s.
 ///
 /// If dropped without converting to a [`TaskSet`], the builder will abort all
 /// tasks added to the list.
-pub struct TaskSetBuilder(Vec<JoinHandle<()>>);
+pub struct TaskSetBuilder<T>(Vec<JoinHandle<T>>);
 
 /// Similar in concept to a [`JoinSet`], but allows for the collection of
 /// [`JoinHandle`]s without needing to spawn them in the context of the set.
@@ -49,7 +49,7 @@ pub struct TaskSetBuilder(Vec<JoinHandle<()>>);
 /// All active tasks in the set are aborted when the set is dropped.
 ///
 /// [`TaskSet`]s should not be created directly, see [`TaskSetBuilder`] instead.
-pub struct TaskSet(Option<SelectAll<JoinHandle<()>>>);
+pub struct TaskSet<T>(Option<SelectAll<JoinHandle<T>>>);
 
 /// Trait defining common functionality for collections of task handles.
 #[async_trait]
@@ -123,20 +123,20 @@ impl<T> ControlledJoinHandle<T> {
     }
 }
 
-impl<T> ValueJoinHandle<T> {
+impl<T, R> ValueJoinHandle<T, R> {
     /// Creates a new [`ValueJoinHandle`] from the given value and task handle.
-    pub fn new(val: T, task: JoinHandle<()>) -> Self {
+    pub fn new(val: T, task: JoinHandle<R>) -> Self {
         Self(val, task)
     }
 
     /// Consumes the [`ValueJoinHandle`], returning the underlying value and
     /// task handle.
-    pub fn into_tuple(self) -> (T, JoinHandle<()>) {
+    pub fn into_tuple(self) -> (T, JoinHandle<R>) {
         (self.0, self.1)
     }
 }
 
-impl TaskSetBuilder {
+impl<T> TaskSetBuilder<T> {
     /// Creates an empty [`TaskSetBuilder`].
     pub fn new() -> Self {
         Self(Vec::new())
@@ -144,24 +144,41 @@ impl TaskSetBuilder {
 
     /// Adds the given [`JoinHandle`] to the list of tasks to add to the
     /// [`TaskSet`].
-    pub fn insert(&mut self, handle: JoinHandle<()>) {
+    pub fn insert(&mut self, handle: JoinHandle<T>) {
         self.0.push(handle);
     }
 
     /// Destructures the given [`ValueJoinHandle`] before inserting just the
     /// task handle into the set, returing the associated value.
-    pub fn detaching_insert<T>(&mut self, handle: ValueJoinHandle<T>) -> T {
+    pub fn detaching_insert<V>(&mut self, handle: ValueJoinHandle<V, T>) -> V {
         self.insert(handle.1);
         handle.0
     }
 
     /// Consumes this [`TaskSetBuilder`] and creates a corresponding
     /// [`TaskSet`] over the collected tasks.
-    pub fn build(mut self) -> TaskSet {
+    pub fn build(mut self) -> TaskSet<T> {
         if !self.0.is_empty() {
             TaskSet(Some(future::select_all(mem::take(&mut self.0))))
         } else {
             TaskSet(None)
+        }
+    }
+}
+
+impl<T> TaskSet<T> {
+    pub fn merge(self, other: Self) -> Self {
+        if let Some(task_fut) = self.0 {
+            let mut tasks = task_fut.into_inner();
+
+            if let Some(other_task_fut) = other.0 {
+                let mut other_tasks = other_task_fut.into_inner();
+                tasks.append(&mut other_tasks)
+            }
+
+            TaskSet(Some(future::select_all(tasks)))
+        } else {
+            other
         }
     }
 }
@@ -177,8 +194,8 @@ where F: FnOnce(OneshotReceiver<()>) -> JoinHandle<T> {
 }
 
 #[async_trait]
-impl TaskContainer<()> for TaskSet {
-    async fn join_next(&mut self) -> Option<Result<(), JoinError>> {
+impl<T> TaskContainer<T> for TaskSet<T> {
+    async fn join_next(&mut self) -> Option<Result<T, JoinError>> {
         if let Some(next_task) = &mut self.0 {
             let (result, _, tasks) = next_task.await;
 
@@ -210,13 +227,13 @@ impl<T: Send + 'static> TaskContainer<T> for JoinSet<T> {
     }
 }
 
-impl<T> AsRef<T> for ValueJoinHandle<T> {
+impl<T, R> AsRef<T> for ValueJoinHandle<T, R> {
     fn as_ref(&self) -> &T {
         &self.0
     }
 }
 
-impl<T> AsMut<T> for ValueJoinHandle<T> {
+impl<T, R> AsMut<T> for ValueJoinHandle<T, R> {
     fn as_mut(&mut self) -> &mut T {
         &mut self.0
     }
@@ -236,7 +253,7 @@ impl<T> Drop for AbortingJoinHandle<T> {
     }
 }
 
-impl Drop for TaskSetBuilder {
+impl<T> Drop for TaskSetBuilder<T> {
     fn drop(&mut self) {
         for handle in &self.0 {
             handle.abort();
@@ -244,7 +261,7 @@ impl Drop for TaskSetBuilder {
     }
 }
 
-impl Drop for TaskSet {
+impl<T> Drop for TaskSet<T> {
     fn drop(&mut self) {
         if let Some(tasks) = self.0.take() {
             for handle in tasks.into_inner() {

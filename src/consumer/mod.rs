@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use tokio::sync::watch::Receiver;
 
 use crate::snd::AudioStream;
-use crate::util::task::TaskContainer;
+use crate::util::task::TaskSet;
 
 #[async_trait]
 pub trait AudioConsumer {
@@ -18,5 +18,5 @@ pub trait AudioConsumer {
         self,
         stream: S,
         shutdown_rx: Receiver<bool>
-    ) -> Result<Box<dyn TaskContainer<()>>, Box<dyn Error>>;
+    ) -> Result<TaskSet<()>, Box<dyn Error>>;
 }

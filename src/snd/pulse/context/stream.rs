@@ -277,7 +277,7 @@ pub async fn open_simple(
     ctx: &PulseContextWrapper,
     source_name: impl ToString,
     volume: Option<f64>
-) -> Result<ValueJoinHandle<SampleConsumer>, Code> {
+) -> Result<ValueJoinHandle<SampleConsumer, ()>, Code> {
     let stream = get_connected_stream(ctx, source_name.to_string()).await?;
     let (
         sample_tx,

@@ -1,6 +1,7 @@
 ///! Audio consumer that streams audio to a .wav file.
 
 use std::borrow::Borrow;
+use std::error::Error;
 use std::io::{
     BufWriter,
     Error as IoError,
@@ -9,23 +10,33 @@ use std::io::{
 };
 use std::iter;
 use std::mem;
+use std::path::Path;
 use std::time::{Duration, Instant};
 
+use async_trait::async_trait;
 use byteorder::{LittleEndian, ReadBytesExt};
 use clap::crate_name;
 use log::{error, info, warn};
 use tokio::fs::File as AsyncFile;
 use tokio::sync::watch::Receiver;
-use tokio::task::{self, JoinHandle};
+use tokio::task;
 use wave_stream::samples_by_channel::SamplesByChannel;
 use wave_stream::wave_header::{Channels, SampleFormat, WavHeader};
 use wave_stream::wave_writer::RandomAccessWavWriter;
 
-use crate::snd::StreamNotifier;
+use crate::snd::{AudioStream, StreamNotifier};
 use crate::util;
+use crate::util::task::{TaskSet, TaskSetBuilder};
+use super::AudioConsumer;
 
 const SAMPLE_RATE: u32 = 48000;
 const MAX_RECORDING_WARN_THRESHOLD: Duration = Duration::from_secs(86400); // 1 day
+
+/// Implementation of [`AudioConsumer`] for the WAV format consumer.
+pub struct WavConsumer<'a, P> {
+    output_file: &'a P,
+    read_timeout: Option<Duration>,
+}
 
 struct WavWriteState<I> {
     writer: RandomAccessWavWriter<f32>,
@@ -34,39 +45,56 @@ struct WavWriteState<I> {
     n_sample: usize,
 }
 
-// PUBLIC INTERFACE FUNCTIONS **************************************************
-/// Starts recording the given stream to a new file named according to
-/// `output_file`. If `output_file` is `-`, this will write to standard output.
-pub async fn record<I, S>(
-    output_file: &str,
-    input: I,
-    shutdown_rx: Receiver<bool>
-) -> Result<JoinHandle<()>, IoError>
-where
-    I: Read + Borrow<S> + Send + 'static,
-    S: StreamNotifier + 'static
-{
-    let output = BufWriter::new(
-        AsyncFile::create(output_file).await?.into_std().await
-    );
-    let writer = task::spawn_blocking(move || {
-        wave_stream::write_wav(output, WavHeader {
-            sample_format: SampleFormat::Float,
-            channels: Channels::new().front_left().front_right(),
-            sample_rate: SAMPLE_RATE,
-        })?.get_random_access_f32_writer()
-    }).await.map_err(|_| IoError::from(ErrorKind::Other))??;
-
-    if max_recording_len() < MAX_RECORDING_WARN_THRESHOLD {
-        warn!(
-            "Due to platform limitations, {} can only record {:.2} minutes of \
-             audio. The application will shut down if this length is exceeded.",
-            crate_name!(),
-            max_recording_len().as_secs_f64() / 60f64
-        );
+// TYPE IMPLS ******************************************************************
+impl<'a, P: AsRef<Path>> WavConsumer<'a, P> {
+    /// Creates a new `WavConsumer` that writes to the path provided by
+    /// `output_file`.
+    pub fn new(output_file: &'a P, read_timeout: Option<Duration>) -> Self {
+        Self {
+            output_file,
+            read_timeout
+        }
     }
+}
 
-    Ok(task::spawn_local(record_monitor(writer, input, shutdown_rx)))
+// TRAIT IMPLS *****************************************************************
+#[async_trait]
+impl<'a, P: AsRef<Path>> AudioConsumer for WavConsumer<'a, P> {
+    async fn start<S: AudioStream + Send + Sync>(
+        self,
+        stream: S,
+        shutdown_rx: Receiver<bool>
+    ) -> Result<TaskSet<()>, Box<dyn Error>> {
+        let output = BufWriter::new(
+            AsyncFile::create(self.output_file).await?.into_std().await
+        );
+        let writer = task::spawn_blocking(move || {
+            wave_stream::write_wav(output, WavHeader {
+                sample_format: SampleFormat::FLoat,
+                channels: Channels::new().front_left().front_right(),
+                sample_rate: SAMPLE_RATE
+            })?.get_random_access_f32_writer()
+        }).await.map_err(|_| IoError::from(ErrorKind::Other))??;
+
+        if max_recording_len() < MAX_RECORDING_WARN_THRESHOLD {
+            warn!(
+                "Due to platform limitations, {} can only record {:.2} minutes \
+                 of audio. The application will shut down if this length is \
+                 exceeded.",
+                crate_name!(),
+                max_recording_len().as_secs_f64() / 60f64
+            );
+        }
+
+        let mut tasks = TaskSetBuilder::new();
+        tasks.insert(task::spawn_local(record_monitor(
+            writer,
+            stream.into_sync_stream(self.read_timeout),
+            shutdown_rx
+        )));
+
+        Ok(tasks.build())
+    }
 }
 
 // INTERNAL HELPER FUNCTIONS ***************************************************
@@ -199,15 +227,11 @@ fn stream_to_wav<I: Read>(
 
 /// Monitors the recording process, idling and restarting the write task as
 /// necessary.
-async fn record_monitor<I, S>(
+async fn record_monitor<I>(
     writer: RandomAccessWavWriter<f32>,
     input: I,
     mut shutdown_rx: Receiver<bool>
-)
-where
-    I: Read + Borrow<S> + Send + 'static,
-    S: StreamNotifier
-{
+) where I: Read + StreamNotifier + Send + 'static {
     let mut state = Some(WavWriteState {
         writer,
         input,

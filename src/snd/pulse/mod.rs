@@ -26,9 +26,10 @@ use libpulse::proplist::properties::{
 };
 
 use crate::cfg::InterceptMode;
-use crate::util::task::{TaskSetBuilder, ValueJoinHandle};
+use crate::util::task::{TaskSet, TaskSetBuilder, ValueJoinHandle};
 use self::intercept::{Interceptor, CapturingInterceptor, DuplexingInterceptor};
-use self::context::{AsyncIntrospector, PulseContextWrapper, SampleConsumer};
+use self::context::{AsyncIntrospector, PulseContextWrapper};
+use self::context::stream::SampleConsumer;
 use self::event::{
     AudioEntity,
     ChangeEvent,
@@ -40,7 +41,7 @@ use self::event::{
 use self::event::factory::EventListenerFactory;
 use self::error::{ComponentError, PulseDriverError};
 use self::owned::{OwnedSinkInfo, OwnedSinkInputInfo};
-use super::types::{Driver, DriverInitError};
+use super::types::DriverInitError;
 
 pub use self::cfg::PulseDriverConfig;
 
@@ -123,7 +124,7 @@ impl Display for DriverComponent {
 pub async fn start_driver(
     config: &PulseDriverConfig,
     shutdown_rx: WatchReceiver<bool>
-) -> Result<Driver, DriverInitError<PulseDriverError>> {
+) -> Result<(SampleConsumer, TaskSet<()>), DriverInitError<PulseDriverError>> {
     let (ctx, ctx_task) = connect(
         config.server.as_deref(),
         config.max_mainloop_interval_usec
@@ -140,7 +141,7 @@ pub async fn start_driver(
     match init_result {
         Ok((stream, mut tasks)) => {
             tasks.insert(ctx_task);
-            Ok(Driver::new(stream, tasks.build()))
+            Ok((stream, tasks.build()))
         },
         Err(e) => {
             //If the driver failed to initialize, we need to await the context
@@ -179,7 +180,7 @@ async fn start_stream_intercept(
     matcher: ProplistMatcher,
     config: &PulseDriverConfig,
     intercept_mode: InterceptMode,
-) -> Result<ValueJoinHandle<String>, Code> {
+) -> Result<ValueJoinHandle<String, ()>, Code> {
     let introspect = AsyncIntrospector::from(ctx);
 
     debug!("Establishing event listener for application stream intercept");
@@ -270,7 +271,7 @@ async fn start_stream_intercept(
 async fn connect(
     server: Option<&str>,
     max_mainloop_interval_usec: Option<u64>
-) -> Result<ValueJoinHandle<PulseContextWrapper>, Code> {
+) -> Result<ValueJoinHandle<PulseContextWrapper, ()>, Code> {
     let ctx = PulseContextWrapper::new(
         server,
         max_mainloop_interval_usec
@@ -286,7 +287,7 @@ async fn initialize(
     ctx: PulseContextWrapper,
     shutdown_rx: WatchReceiver<bool>,
     config: &PulseDriverConfig
-) -> Result<(SampleConsumer, TaskSetBuilder), PulseDriverError> {
+) -> Result<(SampleConsumer, TaskSetBuilder<()>), PulseDriverError> {
     let mut driver_tasks = TaskSetBuilder::new();
 
     // Set up the event listener builder (but do not build it just yet)

@@ -3,7 +3,7 @@
 mod async_polyfill;
 pub mod collect;
 mod introspect;
-mod stream;
+pub mod stream;
 
 extern crate libpulse_binding as libpulse;
 
@@ -106,7 +106,7 @@ impl PulseContextWrapper {
     pub async fn new(
         server: Option<&str>,
         max_mainloop_interval_usec: Option<u64>
-    ) -> Result<ValueJoinHandle<Self>, Code> {
+    ) -> Result<ValueJoinHandle<Self, ()>, Code> {
         let (op_queue_tx, op_queue_rx) = mpsc::channel::<ContextThunk>(
             OP_QUEUE_SIZE
         );

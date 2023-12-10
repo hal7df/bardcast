@@ -9,12 +9,10 @@ use std::time::Duration;
 use async_ringbuf::consumer::AsyncConsumer;
 use async_ringbuf::ring_buffer::AsyncRbRead;
 use async_trait::async_trait;
-use futures::executor;
 use futures::future::{self, Either};
 use futures::io::{AsyncRead, AsyncReadExt};
 use ringbuf::ring_buffer::RbRef;
-
-use crate::util::task::TaskContainer;
+use tokio::runtime::{Builder as TokioRuntimeBuilder, Runtime};
 
 const DEFAULT_ASYNC_READ_TIMEOUT: Duration = Duration::from_millis(250u64);
 
@@ -56,27 +54,25 @@ pub trait AudioStream {
 /// blocking [`Read`] is required, with a configurable read timeout.
 pub struct SyncStreamAdapter<A> {
     reader: A,
+    runtime: Option<Runtime>,
     async_timeout: Duration,
-}
-
-/// Wrapper struct for the two functional components of an audio driver: its
-/// stream and any tasks it needs to stay alive.
-pub struct Driver<S> {
-    stream: S,
-    driver_tasks: Box<dyn TaskContainer<()>>,
 }
 
 /// High-level representation of errors that can occur during the process of
 /// starting/initializing a sound driver.
 #[derive(Debug)]
-pub enum DriverStartError {
+pub enum StartError {
     /// The sound driver failed to connect to its backend. The underlying error
     /// object is wrapped as a trait object.
     ConnectionError(Box<dyn Error>),
 
+    /// The consumer failed to initialize after a successful initialization of
+    /// the driver. The underlying error object is wrapped as a trait object.
+    ConsumerInitializationError(Box<dyn Error>),
+
     /// The sound driver encountered an internal error while initializing. The
     /// underlying error object is wrapped as a trait object.
-    InitializationError(Box<dyn Error>),
+    DriverInitializationError(Box<dyn Error>),
 
     /// The application failed to automatically find a suitable sound driver.
     NoAvailableBackends,
@@ -109,19 +105,6 @@ pub enum DriverInitError<E> {
 }
 
 // TYPE IMPLS ******************************************************************
-impl<S> Driver<S>
-where S: AudioStream + StreamNotifier + Sync + 'static {
-    /// Creates a new instance from the given stream and set of tasks.
-    pub fn new<T>(stream: S, tasks: T) -> Self
-    where T: TaskContainer<()> + 'static
-    {
-        Self {
-            stream,
-            driver_tasks: Box::new(tasks),
-        }
-    }
-}
-
 impl<A: AsyncRead + Unpin> SyncStreamAdapter<A> {
     /// Creates a new `AsyncReadAdapter` from the given [`AsyncRead`]
     /// implementor, and read timeout. If no timeout is given, a timeout of a
@@ -129,6 +112,7 @@ impl<A: AsyncRead + Unpin> SyncStreamAdapter<A> {
     pub fn new(reader: A, async_timeout: Option<Duration>) -> Self {
         Self {
             reader,
+            runtime: None,
             async_timeout: async_timeout.unwrap_or(DEFAULT_ASYNC_READ_TIMEOUT),
         }
     }
@@ -181,7 +165,16 @@ impl<A> BorrowMut<A> for SyncStreamAdapter<A> {
 
 impl<A: AsyncRead + Unpin> Read for SyncStreamAdapter<A> {
     fn read(&mut self, buf: &mut [u8]) -> Result<usize, IoError> {
-        executor::block_on(async {
+        if self.runtime.is_none() {
+            self.runtime = Some(TokioRuntimeBuilder::new_current_thread()
+                .enable_time()
+                .build()?
+            )
+        }
+
+        self.runtime.expect(
+            "SyncStreamAdapter should have an initialized Runtime"
+        ).block_on(async {
             let timeout = tokio::time::sleep(self.async_timeout);
             tokio::pin!(timeout);
 
@@ -198,24 +191,29 @@ impl<A: AsyncRead + Unpin> Read for SyncStreamAdapter<A> {
     }
 }
 
-impl Display for DriverStartError {
+impl Display for StartError {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), FormatError> {
         match self {
-            DriverStartError::ConnectionError(e) => write!(
+            StartError::ConnectionError(e) => write!(
                 f,
                 "Sound driver failed to connect to backend: {}",
                 e
             ),
-            DriverStartError::InitializationError(e) => write!(
+            StartError::ConsumerInitializationError(e) => write!(
+                f,
+                "Audio consumer failed to initialize: {}",
+                e
+            ),
+            StartError::DriverInitializationError(e) => write!(
                 f,
                 "Sound driver failed to initialize: {}",
                 e
             ),
-            DriverStartError::NoAvailableBackends => write!(
+            StartError::NoAvailableBackends => write!(
                 f,
                 "No audio backends available"
             ),
-            DriverStartError::UnknownDriver(name) => write!(
+            StartError::UnknownDriver(name) => write!(
                 f,
                 "No such sound driver '{}'",
                 name
@@ -241,7 +239,7 @@ impl<E: Display> Display for DriverInitError<E> {
     }
 }
 
-impl Error for DriverStartError {}
+impl Error for StartError {}
 
 impl<E: Error + 'static> Error for DriverInitError<E> {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
@@ -252,13 +250,13 @@ impl<E: Error + 'static> Error for DriverInitError<E> {
     }
 }
 
-impl<E: Error + 'static> From<DriverInitError<E>> for DriverStartError {
+impl<E: Error + 'static> From<DriverInitError<E>> for StartError {
     fn from(init_error: DriverInitError<E>) -> Self {
         match init_error {
             DriverInitError::ConnectionError(e) =>
-                DriverStartError::ConnectionError(Box::new(e)),
+                StartError::ConnectionError(Box::new(e)),
             DriverInitError::InitializationError(e) =>
-                DriverStartError::InitializationError(Box::new(e)),
+                StartError::DriverInitializationError(Box::new(e)),
         }
     }
 }
