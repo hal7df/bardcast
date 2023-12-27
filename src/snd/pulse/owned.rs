@@ -51,7 +51,7 @@ pub struct OwnedSinkInfo {
     pub formats: Vec<FormatInfo>,
 }
 
-// Owned version of [`SinkInputInfo`].
+/// Owned version of [`SinkInputInfo`].
 #[derive(Debug, Clone)]
 pub struct OwnedSinkInputInfo {
     pub index: u32,

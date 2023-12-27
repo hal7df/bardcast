@@ -2,7 +2,6 @@
 ///! application.
 
 pub mod fmt;
-pub mod io;
 pub mod task;
 
 use std::mem::{self, ManuallyDrop};
@@ -95,7 +94,7 @@ impl<T> Lessor<T> {
     }
 
     /// Takes an immutable reference to the controlled value, if currently
-    /// owned by the `Lessor1.
+    /// owned by the `Lessor`.
     pub fn as_ref(&self) -> Option<&T> {
         if let LessorState::Owned(value) = &self.0 {
             Some(value)
