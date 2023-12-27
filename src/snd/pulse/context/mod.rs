@@ -122,14 +122,40 @@ impl PulseContextWrapper {
     /// Submits the given context operation to the background task.
     ///
     /// This function does not provide a return channel. If a result is needed
-    /// from the task, either use [`PulseContextWrapper::do_ctx_op`] and its
-    /// cohort, or manually implement the return channel in the submitted
-    /// operation.
-    pub async fn with_ctx<F>(&self, op: F)
+    /// from the task, refer to [`PulseContextWrapper::with_ctx()`] for simple
+    /// cases. When a context task that produces an asynchronous [`Operation`],
+    /// use [`PulseContextWrapper::do_ctx_op`] and its cohort instead.
+    pub async fn submit<F>(&self, op: F)
     where F: FnOnce(&mut Context) + Send + 'static {
         if self.0.send(Box::new(op)).await.is_err() {
             panic!("PulseAudio context handler task unexpectedly terminated");
         }
+    }
+
+    /// Runs and awaits the submitted context operation, returning its result.
+    ///
+    /// If the operation works with context operations that return an
+    /// asynchronous [`Operation`] handle, use
+    /// [`PulseContextWrapper::do_ctx_op`] and its cohort instead.
+    pub async fn with_ctx<F, T>(&self, op: F) -> T
+    where F: FnOnce(&mut Context) -> T + Send + 'static {
+        let (tx, rx) = oneshot::channel::<T>();
+
+        self.submit(move |ctx| {
+            if tx.send(op(ctx)).is_err() {
+                panic!("Context task result receiver unexpectedly dropped");
+            }
+        });
+
+        rx.await.expect("Context task unexpectedly dropped without returning")
+    }
+
+    /// Spawns a task to execute the given future on the context thread.
+    pub async fn spawn<T>(
+        &self,
+        fut: impl Future<Output = T> + Send + 'static
+    ) -> JoinHandle<T> {
+        self.with_ctx(move |_| task::spawn_local(fut)).await
     }
 
     /// Core implementation of the [`PulseWrapper::do_ctx_op`] family of
@@ -145,7 +171,7 @@ impl PulseContextWrapper {
         F: FnOnce(&mut Context, Weak<Mutex<T>>) -> Operation<S> + Send + 'static {
         let (tx, rx) = oneshot::channel::<Result<T, OperationState>>();
 
-        self.with_ctx(move |ctx| {
+        self.submit(move |ctx| {
             let value = Arc::new(Mutex::new(initial_value));
             let op = Arc::new(Mutex::new(Some(op(ctx, Arc::downgrade(&value)))));
 

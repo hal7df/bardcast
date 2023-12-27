@@ -13,6 +13,8 @@ use std::task::{Context, Poll, Waker};
 use libpulse::context::{Context as PulseContext, State as PulseContextState};
 use libpulse::stream::{Stream as PulseStream, State as PulseStreamState};
 
+use super::PulseContextWrapper;
+
 //TYPE DEFINITIONS *************************************************************
 
 /// Generic representation of state for an entity that initializes
@@ -108,6 +110,23 @@ impl<S, T: InitializingEntity<S>> Drop for InitializingFuture<S, T> {
             //nonexistent task
             entity.wake_on_state_change(None)
         }
+    }
+}
+
+impl<S: Unpin, T: InitializingEntity<S> + Unpin> InitializingFuture<S, T> {
+    /// Awaits this future on the same thread as the context handler.
+    ///
+    /// `InitializingFuture` is generally not safe to await on a separate thread
+    /// from the [`PulseContext`] that spawned the entity it holds. (This is
+    /// difficult to model with the [`Send`] trait, as it is sometimes useful to
+    /// move an `InitializingFuture` between threads, but not await it). In the
+    /// event that the owner of the future cannot spawn a local task on the
+    /// context thread, this helper function spawns a task on the contex thread
+    /// using a reference to the [`PulseContextWrapper`], and returns the
+    /// result.
+    pub async fn await_on(self, ctx_wrap: &PulseContextWrapper) -> Result<T, S> {
+        ctx_wrap.spawn(async move { self.await }).await
+            .expect("Entity initialization task unexpectedly failed")
     }
 }
 

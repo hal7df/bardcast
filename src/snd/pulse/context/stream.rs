@@ -2,17 +2,19 @@
 
 extern crate libpulse_binding as libpulse;
 
-use std::cmp;
-use std::iter;
-use std::mem;
+use std::panic;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
 use async_ringbuf::{AsyncConsumer, AsyncProducer, AsyncRb};
-use log::{debug, error, trace, warn};
+use async_trait::async_trait;
+use log::{debug, error, info, trace, warn};
 use ringbuf::HeapRb;
-use tokio::sync::oneshot;
-use tokio::task;
+use tokio::sync::oneshot::{
+    self,
+    Receiver as OneshotReceiver,
+    Sender as OneshotSender
+};
+use tokio::task::JoinHandle;
 
 use libpulse::channelmap::Map as ChannelMap;
 use libpulse::context::Context;
@@ -25,12 +27,10 @@ use libpulse::stream::{
     Stream
 };
 
-use crate::snd::F32LE_STEREO_SAMPLE_SIZE;
-use crate::util::task::ValueJoinHandle;
-use super::super::owned::OwnedSinkInputInfo;
+use crate::util::{Lease, Lessor};
+use super::super::owned::{OwnedSinkInfo, OwnedSinkInputInfo};
 use super::{AsyncIntrospector, PulseContextWrapper};
 use super::async_polyfill::{InitializingFuture, StreamReadNotifier};
-
 
 // MODULE-INTERNAL CONSTANTS ***************************************************
 
@@ -49,22 +49,30 @@ const SAMPLE_SPEC: SampleSpec = SampleSpec {
     rate: SAMPLE_RATE,
 };
 
-/// The maximum number of stereo IEEE 754 32-bit floating point audio samples
-/// that can be counted by a usize.
-const MAX_F32LE_STEREO_SAMPLES: usize = usize::MAX / F32LE_STEREO_SAMPLE_SIZE;
-
-/// The number of microseconds per second (1000000)
-const MICROS_PER_SECOND: u128 = Duration::from_secs(1).as_micros();
-
-const MAX_CONSECUTIVE_ERRORS: u8 = 3;
+const MAX_CONSECUTIVE_ERRORS: usize = 3;
 
 // TYPE DEFINITIONS ************************************************************
-struct StreamHandler {
-    ctx: PulseContextWrapper,
-    sample_tx: Producer<u8>,
-    stream: Option<(Stream, StreamReadNotifier)>,
-    last_write: Instant,
+pub trait StreamConfig {
+    fn configure(&self, stream: Stream) -> Result<Stream, Code>;
 }
+
+#[async_trait]
+pub trait IntoStreamConfig {
+    type Target: StreamConfig + Send + 'static;
+
+    async fn resolve(
+        self,
+        introspect: &AsyncIntrospector
+    ) -> Result<Self::Target, Code>;
+}
+
+pub struct StreamManager {
+    ctx: PulseContextWrapper,
+    sample_tx: Lessor<Producer<u8>>,
+    task: Option<(OneshotSender<()>, JoinHandle<()>)>,
+}
+
+pub struct ResolvedSinkInput(OwnedSinkInputInfo, OwnedSinkInfo);
 
 enum StreamWriteResult {
     DataWritten,
@@ -81,260 +89,258 @@ type Producer<T> = AsyncProducer<T, Arc<AsyncRb<T, HeapRb<T>>>>;
 pub type SampleConsumer = Consumer<u8>;
 
 // TYPE IMPLS ******************************************************************
-impl StreamHandler {
-    async fn new(ctx: PulseContextWrapper, sample_tx: Producer<u8>) -> Self {
-        let mut handler = Self {
+impl StreamManager {
+    pub fn new(ctx: PulseContextWrapper) -> (Self, Consumer<u8>) {
+        let (tx, rx) = AsyncRb::<u8, HeapRb<u8>>::new(SAMPLE_QUEUE_SIZE).split();
+
+        (Self {
             ctx,
-            sample_tx,
-            stream: None,
-            last_write: Instant::now()
-        };
-
-        //Inject a single sample of silence into the stream, to synchronize the
-        //downstream reader with the handler loop, once it starts
-        handler.write_silence(1).await
-            .expect("Sample consumer terminated unexpectedly");
-
-        handler
+            sample_tx: Lessor::new(tx),
+            task: None,
+        }, rx)
     }
 
-    fn from_stream(
-        ctx: PulseContextWrapper,
-        sample_tx: Producer<u8>,
-        mut stream: Stream
-    ) -> Self {
-        let notify = StreamReadNotifier::new(&mut stream);
-
-        Self {
-            ctx,
-            sample_tx,
-            stream: Some((stream, notify)),
-            last_write: Instant::now()
-        }
+    pub fn is_running(&self) -> bool {
+        self.task.is_some()
     }
 
-    async fn start(mut self) {
-        let mut consecutive_err_count = 0u8;
+    pub async fn monitor(&mut self) {
+        let panic_obj = if let Some((_, task_handle)) = self.task.as_mut() {
+            let task_res = task_handle.await;
 
-        while !self.sample_tx.is_closed() {
-            self.await_next_write().await;
-            
-            if let StreamWriteResult::PulseError(_) = self.write_next_chunk().await {
-                consecutive_err_count += 1;
-
-                if consecutive_err_count > MAX_CONSECUTIVE_ERRORS {
-                    let msg = format!(
-                        "PulseAudio stream handler encountered {} consecutive errors",
-                        consecutive_err_count
-                    );
-                    error!("{}, terminating", msg);
-                    panic!("{}", msg);
+            if let Err(task_err) = task_res {
+                if let Ok(panic_obj) = task_err.try_into_panic() {
+                    Some(panic_obj)
+                } else {
+                    None
                 }
             } else {
-                consecutive_err_count = 0u8;
-            }
-        }
-    }
-
-    async fn write_next_chunk(&mut self) -> StreamWriteResult {
-        if let Some((stream, _)) = self.stream.as_mut() {
-            match stream.peek() {
-                Ok(PeekResult::Data(samples)) => {
-                    self.last_write = Instant::now();
-                    let mut result = StreamWriteResult::DataWritten;
-
-                    if self.sample_tx.push_slice(samples).await.is_err() {
-                        debug!(
-                            "Sample receiver dropped while transmitting samples"
-                        );
-                        result = StreamWriteResult::HandleClosed;
-                    }
-                    if let Err(e) = stream.discard() {
-                        warn!("Failure to discard stream sample: {}", e);
-                    }
-
-                    result
-                },
-                Ok(PeekResult::Hole(hole_size)) => {
-                    warn!(
-                        "PulseAudio stream returned hold of size {} bytes",
-                        hole_size
-                    );
-
-                    if let Err(e) = stream.discard() {
-                        warn!("Failure to discard stream sample: {}", e);
-                    }
-
-                    StreamWriteResult::NoOp
-                },
-                Ok(PeekResult::Empty) => {
-                    trace!("PulseAudio stream had no data");
-                    StreamWriteResult::NoOp
-                },
-                Err(e) => {
-                    error!("Failed to read audio from PulseAudio: {}", e);
-                    StreamWriteResult::PulseError(
-                        Code::try_from(e).unwrap_or(Code::Unknown)
-                    )
-                },
+                None
             }
         } else {
-            self.write_silence_chunk().await
+            None
+        };
+
+        // If this function is not cancelled before this point is reached, the
+        // task is guaranteed to be stopped.
+        if self.task.is_some() {
+            self.task = None;
         }
+
+        if let Some(panic_obj) = panic_obj {
+            panic::resume_unwind(panic_obj);
+        }
+
+        self.sample_tx.await_release().await;
     }
 
-    async fn write_silence_chunk(&mut self) -> StreamWriteResult {
-        let usec_since_last_write = self.update_last_write().as_micros();
-        let mut samples_since_last_write = 
-            (usec_since_last_write * SAMPLE_RATE as u128) / MICROS_PER_SECOND;
-
-        let mut data_written = false;
-
-        //It's unlikely that this loop will execute more than once per call
-        //to write_next_chunk() -- the consumer would have to lag by roughly
-        //9 minutes on 32-bit architectures for that to happen -- but we
-        //would have to handle the overflow condition anyways, and it's
-        //relatively simple to handle gracefully with a loop.
-        while samples_since_last_write > 0 {
-            let samples_to_write = cmp::min(
-                usize::try_from(samples_since_last_write)
-                    .unwrap_or(MAX_F32LE_STEREO_SAMPLES),
-                MAX_F32LE_STEREO_SAMPLES
-            );
-            data_written = true;
-
-            if self.write_silence(samples_to_write).await.is_err() {
-                return StreamWriteResult::HandleClosed;
+    pub async fn start<'a>(
+        &'a mut self,
+        source: impl IntoStreamConfig + 'a,
+        volume: Option<f64>
+    ) -> Result<(), Code> {
+        if let Some(sample_tx) = self.sample_tx.lease() {
+            if self.is_running() {
+                return Err(Code::Exist);
             }
 
-            samples_since_last_write =
-                samples_since_last_write.saturating_sub(
-                    samples_to_write as u128
-                );
-        }
+            let stream = get_connected_stream(&self.ctx, source).await?;
 
-        if data_written {
-            StreamWriteResult::DataWritten
-        } else {
-            StreamWriteResult::NoOp
-        }
-    }
+            if let Some(volume) = volume {
+                AsyncIntrospector::from(&self.ctx).set_source_output_volume(
+                    stream.get_index().unwrap(),
+                    volume
+                ).await?;
+            }
 
-    async fn write_silence(&mut self, n_samples: usize) -> Result<(), usize> {
-        if let Err(remaining_bytes) = self.sample_tx.push_iter(
-            iter::repeat(0u8).take(n_samples * F32LE_STEREO_SAMPLE_SIZE)
-        ).await {
-            Err(remaining_bytes.count() / F32LE_STEREO_SAMPLE_SIZE)
-        } else {
+            let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+            let task_handle = self.ctx.spawn(do_stream(
+                stream,
+                sample_tx,
+                shutdown_rx
+            )).await;
+
+            self.task = Some((shutdown_tx, task_handle));
             Ok(())
-        }
-    }
-
-    async fn await_next_write(&self) {
-        if let Some((_, notify)) = self.stream.as_ref() {
-            notify.await_data().await;
         } else {
-            self.sample_tx.wait_free(self.sample_tx.capacity()).await;
+            Err(Code::Exist)
         }
     }
 
-    fn update_last_write(&mut self) -> Duration {
-        let duration_since_last_write = self.last_write.elapsed();
-        self.last_write = Instant::now();
-
-        duration_since_last_write
-    }
-
-    fn close_input(&mut self) {
-        if let Some((mut stream, notify)) = self.stream.take() {
-            notify.close(&mut stream);
-
-            if let Err(e) = stream.disconnect() {
-                warn!("Record stream failed to disconnect: {}", e);
+    pub async fn stop(&mut self) {
+        if let Some((shutdown_tx, task_handle)) = self.task.take() {
+            if shutdown_tx.send(()).is_err() && !task_handle.is_finished() {
+                warn!("PulseAudio stream handler ignored shutdown signal. \
+                       Forcibly aborting task");
+                task_handle.abort();
             }
+
+            if let Err(task_err) = task_handle.await {
+                if let Ok(panic_obj) = task_err.try_into_panic() {
+                    panic::resume_unwind(panic_obj);
+                }
+            }
+
+            self.sample_tx.await_release().await;
         }
     }
 }
 
 // TRAIT IMPLS *****************************************************************
-impl Drop for StreamHandler {
+#[async_trait]
+impl<C: StreamConfig + Send + 'static> IntoStreamConfig for C {
+    type Target = C;
+
+    async fn resolve(
+        self,
+        _: &AsyncIntrospector
+    ) -> Result<Self::Target, Code> {
+        Ok(self)
+    }
+}
+
+#[async_trait]
+impl<I> IntoStreamConfig for Option<I>
+where I: IntoStreamConfig<Target = OwnedSinkInfo> + Send {
+    type Target = OwnedSinkInfo;
+
+    async fn resolve(
+        self,
+        introspect: &AsyncIntrospector
+    ) -> Result<Self::Target, Code> {
+        if let Some(into_config) = self {
+            into_config.resolve(introspect).await
+        } else {
+            introspect.get_default_sink().await
+        }
+    }
+}
+
+#[async_trait]
+impl IntoStreamConfig for &str {
+    type Target = OwnedSinkInfo;
+
+    async fn resolve(
+        self,
+        introspect: &AsyncIntrospector
+    ) -> Result<Self::Target, Code> {
+        introspect.get_sink_by_name(self).await
+    }
+}
+
+#[async_trait]
+impl IntoStreamConfig for u32 {
+    type Target = OwnedSinkInfo;
+
+    async fn resolve(
+        self,
+        introspect: &AsyncIntrospector
+    ) -> Result<Self::Target, Code> {
+        introspect.get_sink_by_index(self).await
+    }
+}
+
+#[async_trait]
+impl IntoStreamConfig for OwnedSinkInputInfo {
+    type Target = ResolvedSinkInput;
+
+    async fn resolve(
+        self,
+        introspect: &AsyncIntrospector
+    ) -> Result<Self::Target, Code> {
+        Ok(ResolvedSinkInput(
+            self,
+            introspect.get_sink_by_index(self.sink).await?
+        ))
+    }
+}
+
+impl StreamConfig for OwnedSinkInfo {
+    fn configure(&self, mut stream: Stream) -> Result<Stream, Code> {
+        if let Some(source_name) = self.monitor_source_name.as_ref() {
+           stream.connect_record(
+               Some(&source_name),
+               None,
+               FlagSet::START_UNMUTED
+            ).map_err(|pa_err| Code::try_from(pa_err).unwrap_or(Code::Unknown))?;
+
+           Ok(stream)
+        } else {
+            Err(Code::NoEntity)
+        }
+    }
+}
+
+impl StreamConfig for ResolvedSinkInput {
+    fn configure(&self, mut stream: Stream) -> Result<Stream, Code> {
+        stream.set_monitor_stream(self.0.index)
+            .map_err(|pa_err| Code::try_from(pa_err).unwrap_or(Code::Unknown))?;
+
+        self.1.configure(stream)
+    }
+}
+
+impl Drop for StreamManager {
     fn drop(&mut self) {
         debug!("PulseAudio stream handler shutting down");
 
-        self.close_input();
+        if let Some((shutdown_tx, _)) = self.task.take() {
+            warn!("PulseAudio stream manager shutting down while stream handler active");
+            if shutdown_tx.send(()).is_err() {
+                info!(
+                    "PulseAudio stream handler task unexpectedly shut down before manager"
+                );
+            }
+        }
 
         debug!("PulseAudio stream handler shut down");
     }
 }
 
 // HELPER FUNCTIONS ************************************************************
-
-/// Opens a recording stream against the audio source with the given name,
-/// at the requested volume, if any. Returns a consuming handle for the
-/// stream and the underlying task performing the raw stream handling in a
-/// [`ValueJoinHandle`].
-pub async fn open_simple(
-    ctx: &PulseContextWrapper,
-    source_name: impl ToString,
-    volume: Option<f64>
-) -> Result<ValueJoinHandle<SampleConsumer, ()>, Code> {
-    let stream = get_connected_stream(ctx, source_name.to_string()).await?;
-    let (
-        sample_tx,
-        sample_rx
-    ) = AsyncRb::<u8, HeapRb<u8>>::new(SAMPLE_QUEUE_SIZE).split();
-
-    if let Some(volume) = volume {
-        AsyncIntrospector::from(ctx).set_source_output_volume(
-            stream.get_index().unwrap(),
-            volume
-        ).await?
+/// Determines if the stream handler should continue reading samples, or exit.
+///
+/// This also waits for data to appear in the underlying stream, to prevent
+/// needless iterating over a stream with no data.
+async fn should_continue_stream_read(
+    sample_tx: &AsyncProducer<u8, Arc<AsyncRb<u8, HeapRb<u8>>>>,
+    notify: &StreamReadNotifier,
+    shutdown_rx: &mut OneshotReceiver<()>
+) -> bool {
+    if sample_tx.is_closed() {
+        false
+    } else {
+        tokio::select! {
+            _ = notify.await_data() => true,
+            _ = shutdown_rx => false,
+        }
     }
-
-    Ok(ValueJoinHandle::new(
-        sample_rx,
-        task::spawn_local(do_stream_simple(
-            ctx.clone(),
-            stream,
-            sample_tx,
-        )
-    )))
-}
-
-async fn do_stream_simple(
-    ctx: PulseContextWrapper,
-    mut stream: Stream,
-    mut sample_tx: Producer<u8>
-) {
-    let notify = StreamReadNotifier::new(&mut stream);
-
-    while should_continue_stream_read(&sample_tx, &notify).await &&
-        stream_read(&mut stream, &mut sample_tx).await {}
-
-    debug!("Stream handler shutting down");
-    stream_disconnect(&mut stream, notify);
-
-    //We only have a reference to the context to drop it here, in order to
-    //prevent the PulseAudio connection from shutting down prematurely
-    mem::drop(ctx);
-
-    debug!("Stream handler shut down");
 }
 
 async fn stream_read(
     stream: &mut Stream,
     sample_tx: &mut Producer<u8>
-) -> bool {
+) -> StreamWriteResult {
     match stream.peek() {
         Ok(PeekResult::Data(samples)) => {
+            let mut res = StreamWriteResult::DataWritten;
+
             if sample_tx.push_iter(samples.iter().copied()).await.is_err() {
-                //If this happens, we can break the loop immediately, since we
-                //know the receiver dropped.
                 debug!("Sample receiver dropped while transmitting samples");
-                return false;
-            } else if let Err(e) = stream.discard() {
-                warn!("Failure to discard stream sample: {}", e);
+                res = StreamWriteResult::HandleClosed;
             }
+
+            if let Err(e) = stream.discard() {
+                warn!("Failure to discard stream sample: {}", e);
+
+                if !matches!(res, StreamWriteResult::HandleClosed) {
+                    res = StreamWriteResult::PulseError(
+                        Code::try_from(e).unwrap_or(Code::Unknown)
+                    )
+                }
+            }
+
+            res
         },
         Ok(PeekResult::Hole(hole_size)) => {
             warn!(
@@ -343,13 +349,62 @@ async fn stream_read(
             );
             if let Err(e) = stream.discard() {
                 warn!("Failure to discard stream sample: {}", e);
+                StreamWriteResult::PulseError(
+                    Code::try_from(e).unwrap_or(Code::Unknown)
+                )
+            } else {
+                StreamWriteResult::NoOp
             }
         },
-        Ok(PeekResult::Empty) => trace!("PulseAudio stream had no data"),
-        Err(e) => error!("Failed to read audio from PulseAudio: {}", e),
+        Ok(PeekResult::Empty) => {
+            trace!("PulseAudio stream had no data");
+            StreamWriteResult::NoOp
+        },
+        Err(e) => StreamWriteResult::PulseError(
+            Code::try_from(e).unwrap_or(Code::Unknown)
+        ),
+    }
+}
+
+async fn do_stream(
+    mut stream: Stream,
+    mut sample_tx: Lease<Producer<u8>>,
+    mut shutdown_rx: OneshotReceiver<()>
+) {
+    let notify = StreamReadNotifier::new(&mut stream);
+    let mut err_count = 0usize;
+
+    while should_continue_stream_read(
+        &sample_tx,
+        &notify,
+        &mut shutdown_rx
+    ).await {
+        match stream_read(&mut stream, &mut sample_tx).await {
+            StreamWriteResult::HandleClosed => break,
+            StreamWriteResult::PulseError(e) => {
+                error!("Error reading from stream: {}", e);
+                err_count += 1;
+
+                if err_count >= MAX_CONSECUTIVE_ERRORS {
+                    break;
+                }
+            },
+            StreamWriteResult::DataWritten | StreamWriteResult::NoOp => {
+                err_count = 0
+            },
+        }
     }
 
-    true
+    debug!("Stream handler shutting down");
+    stream_disconnect(&mut stream, notify);
+    debug!("Stream handler shut down");
+
+    if err_count >= MAX_CONSECUTIVE_ERRORS {
+        panic!(
+            "Stream handler encountered {} consecutive errors, exiting abnormally",
+            err_count
+        );
+    }
 }
 
 fn stream_disconnect(
@@ -367,21 +422,16 @@ fn stream_disconnect(
 /// given name.
 async fn get_connected_stream(
     ctx_wrap: &PulseContextWrapper,
-    source_name: String
+    source: impl IntoStreamConfig
 ) -> Result<Stream, Code> {
-    let (tx, rx) = oneshot::channel();
+    let source = source.resolve(&AsyncIntrospector::from(ctx_wrap)).await?;
 
-    ctx_wrap.with_ctx(move |ctx| {
-        if tx.send(create_and_connect_stream(ctx, &source_name)).is_err() {
-            panic!("Stream receiver unexpectedly terminated");
-        }
-    }).await;
+    let stream_fut = ctx_wrap.with_ctx(move |ctx| create_and_connect_stream(
+        ctx,
+        source
+    )).await?;
 
-    // Note: stream_fut makes PulseAudio API calls directly, so we need
-    // to await it in a local task.
-    let stream_fut = rx.await.map_err(|_| Code::NoData)??;
-    task::spawn_local(stream_fut).await
-        .map_err(|_| Code::Killed)?
+    stream_fut.await_on(ctx_wrap).await
         .map_err(|state| if state == State::Terminated {
             Code::Killed
         } else {
@@ -394,7 +444,7 @@ async fn get_connected_stream(
 /// state.
 fn create_and_connect_stream(
     ctx: &mut Context,
-    source_name: impl AsRef<str>
+    config: impl StreamConfig
 ) -> Result<InitializingFuture<State, Stream>, Code> {
     //Technically init_stereo should create a new channel map with the format
     //specifier "front-left,front-right", but due to oddities in the Rust
@@ -412,27 +462,5 @@ fn create_and_connect_stream(
         Some(&channel_map)
     ).expect("Failed to open record stream");
 
-    stream.connect_record(
-        Some(source_name.as_ref()),
-        None,
-        FlagSet::START_UNMUTED
-    ).map_err(|pa_err| Code::try_from(pa_err).unwrap_or(Code::Unknown))?;
-
-    Ok(InitializingFuture::from(stream))
-}
-
-/// Determines if the stream handler should continue reading samples, or exit.
-///
-/// This also waits for data to appear in the underlying stream, to prevent
-/// needless iterating over a stream with no data.
-async fn should_continue_stream_read(
-    sample_tx: &AsyncProducer<u8, Arc<AsyncRb<u8, HeapRb<u8>>>>,
-    notify: &StreamReadNotifier
-) -> bool {
-    if sample_tx.is_closed() {
-        false
-    } else {
-        notify.await_data().await;
-        true
-    }
+    Ok(InitializingFuture::from(config.configure(stream)?))
 }
