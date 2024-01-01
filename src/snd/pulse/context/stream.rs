@@ -28,7 +28,7 @@ use libpulse::stream::{
 };
 
 use crate::util::{Lease, Lessor};
-use super::super::owned::{OwnedSinkInfo, OwnedSinkInputInfo};
+use super::super::owned::{OwnedSinkInfo, OwnedSinkInputInfo, OwnedSourceInfo};
 use super::{AsyncIntrospector, PulseContextWrapper};
 use super::async_polyfill::{InitializingFuture, StreamReadNotifier};
 
@@ -102,6 +102,10 @@ impl StreamManager {
 
     pub fn is_running(&self) -> bool {
         self.task.is_some()
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.sample_tx.as_ref().is_some_and(|tx| tx.is_closed())
     }
 
     pub async fn monitor(&mut self) {
@@ -265,6 +269,22 @@ impl StreamConfig for OwnedSinkInfo {
             ).map_err(|pa_err| Code::try_from(pa_err).unwrap_or(Code::Unknown))?;
 
            Ok(stream)
+        } else {
+            Err(Code::NoEntity)
+        }
+    }
+}
+
+impl StreamConfig for OwnedSourceInfo {
+    fn configure(&self, mut stream: Stream) -> Result<Stream, Code> {
+        if let Some(name) = self.name.as_ref() {
+            stream.connect_record(
+                Some(&name),
+                None,
+                FlagSet::START_UNMUTED
+            ).map_err(|pa_err| Code::try_from(pa_err).unwrap_or(Code::Unknown))?;
+
+            Ok(stream)
         } else {
             Err(Code::NoEntity)
         }
