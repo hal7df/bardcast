@@ -8,6 +8,8 @@
 
 extern crate libpulse_binding as libpulse;
 
+use std::error::Error;
+use std::fmt::{Display, Error as FormatError, Formatter};
 use std::process;
 
 use async_trait::async_trait;
@@ -18,12 +20,25 @@ use log::{debug, error, warn};
 use libpulse::error::Code;
 
 use super::context::AsyncIntrospector;
-use super::owned::OwnedSinkInfo;
+use super::context::stream::StreamManager;
+use super::event::EventListener;
+use super::owned::{OwnedSinkInfo, OwnedSinkInputInfo};
 
 const TEARDOWN_FAILURE_WARNING: &'static str = "Application audio may not work correctly. Please check your system audio configuration.";
 const SINK_INPUT_MOVE_FAILURE: &'static str = "Some captured inputs failed to move to their original or default sink.";
 
 // TYPE DEFINITIONS ************************************************************
+
+/// Represents possible error modes for [`Interceptor::record()`].
+#[derive(Debug)]
+pub enum InterceptError {
+    /// PulseAudio returned an error while attempting to intercept the
+    /// application.
+    PulseError(Code),
+
+    /// The interceptor cannot concurrently intercept any more applications.
+    AtCapacity(usize),
+}
 
 /// Core abstraction for intercepting application audio.
 ///
@@ -33,15 +48,31 @@ const SINK_INPUT_MOVE_FAILURE: &'static str = "Some captured inputs failed to mo
 /// current state of intercepted streams.
 #[async_trait]
 pub trait Interceptor: Send + Sync {
-    /// Intercepts an application with the given sink input ID.
-    async fn intercept(&mut self, sink_input_id: u32) -> Result<(), Code>;
+    /// Starts recording audio from the given application.
+    async fn record(
+        &mut self,
+        source: OwnedSinkInputInfo
+    ) -> Result<(), InterceptError>;
 
-    /// Returns the system name of the audio source that can be used to read
-    /// intercepted application audio.
-    fn source_name(&self) -> Result<String, Code>;
+    /// Stops recording audio from the given application. If this interceptor
+    /// is not currently recording audio from the given application, this
+    /// returns `Ok(false)`.
+    async fn stop(
+        &mut self,
+        source_idx: u32
+    ) -> Result<bool, Code>;
 
-    /// Returns the number applications that have been intercepted by bardcast.
-    async fn intercepted_stream_count(&self) -> Result<usize, Code>;
+    /// Determines if [`Interceptor::monitor()`] must be called to ensure
+    /// underlying tasks are properly monitored and cleaned up during normal
+    /// operation.
+    fn needs_monitor(&self) -> bool;
+
+    /// Monitors and cleans up underlying tasks, if any.
+    async fn monitor(&mut self);
+
+    /// Returns the number of applications that have been intercepted by this
+    /// interceptor.
+    async fn len(&self) -> Result<usize, Code>;
 
     /// Gracefully closes any system resources that were created by the
     /// `Interceptor`, returning any intercepted streams to another audio device
@@ -50,6 +81,41 @@ pub trait Interceptor: Send + Sync {
 
     /// Version of [`Interceptor::close`] for boxed trait objects.
     async fn boxed_close(mut self: Box<Self>);
+}
+
+/// Specialization of [`Interceptor`] that allows for limits on the number of
+/// concurrently captured applications.
+#[async_trait]
+pub trait LimitedInterceptor: Interceptor {
+    /// Returns the number of concurrent applications that can be intercepted
+    /// by this `LimitedInterceptor` instance.
+    ///
+    /// Returns `None` if there is no limit applied to this interceptor.
+    fn capacity(&self) -> Option<usize>;
+
+    /// Returns the number of additional applications that can be concurrently
+    /// intercepted by this `LimitedInterceptor` instance.
+    ///
+    /// Returns `Ok(None)` if there is no limit applied to this interceptor.
+    async fn remaining(&self) -> Result<Option<usize>, Code> {
+        if let Some(capacity) = self.capacity() {
+            self.len().await.map(|size| Some(capacity - size))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Determines whether this interceptor has intercepted the maximum number
+    /// of concurrent applications.
+    ///
+    /// This will always be `Ok(false)` for interceptors with no limit.
+    async fn is_full(&self) -> Result<bool, Code> {
+        if let Some(capacity) = self.capacity() {
+            self.len().await.map(|size| size == capacity)
+        } else {
+            Ok(false)
+        }
+    }
 }
 
 /// Implementation of [`Interceptor`] that captures application audio in a
@@ -120,6 +186,47 @@ impl DuplexingInterceptor {
 }
 
 // TRAIT IMPLS *****************************************************************
+impl From<Code> for InterceptError {
+    fn from(code: Code) -> Self {
+        Self::PulseError(code)
+    }
+}
+
+impl TryFrom<InterceptError> for Code {
+    type Error = InterceptError;
+
+    fn try_from(err: InterceptError) -> Result<Self, Self::Error> {
+        if let InterceptError::PulseError(code) = err {
+            Ok(code)
+        } else {
+            Err(err)
+        }
+    }
+}
+
+impl Display for InterceptError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), FormatError> {
+        match self {
+            Self::PulseError(code) => code.fmt(f),
+            Self::AtCapacity(limit) => write!(
+                f,
+                "Interceptor at limit ({})",
+                limit
+            ),
+        }
+    }
+}
+
+impl Error for InterceptError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        if let Self::PulseError(code) = self {
+            Some(&code)
+        } else {
+            None
+        }
+    }
+}
+
 #[async_trait]
 impl Interceptor for CapturingInterceptor {
     async fn intercept(&mut self, sink_input_id: u32) -> Result<(), Code> {
@@ -133,7 +240,7 @@ impl Interceptor for CapturingInterceptor {
         self.rec.monitor_source_name.clone().ok_or(Code::NoData)
     }
 
-    async fn intercepted_stream_count(&self) -> Result<usize, Code> {
+    async fn len(&self) -> Result<usize, Code> {
        self.introspect.sink_inputs_for_sink(
            self.rec.index
        ).await.map(|inputs| inputs.len())
@@ -184,7 +291,7 @@ impl Interceptor for DuplexingInterceptor {
         self.rec.monitor_source_name.clone().ok_or(Code::NoData)
     }
 
-    async fn intercepted_stream_count(&self) -> Result<usize, Code> {
+    async fn len(&self) -> Result<usize, Code> {
         self.introspect.sink_inputs_for_sink(
             self.demux.index
         ).await.map(|inputs| inputs.len())
