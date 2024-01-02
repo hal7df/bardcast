@@ -113,7 +113,11 @@ impl<S, T: InitializingEntity<S>> Drop for InitializingFuture<S, T> {
     }
 }
 
-impl<S: Unpin, T: InitializingEntity<S> + Unpin> InitializingFuture<S, T> {
+impl<S, T> InitializingFuture<S, T>
+where
+    S: Unpin + Send + 'static,
+    T: InitializingEntity<S> + Unpin + Send + 'static
+{
     /// Awaits this future on the same thread as the context handler.
     ///
     /// `InitializingFuture` is generally not safe to await on a separate thread
@@ -124,8 +128,11 @@ impl<S: Unpin, T: InitializingEntity<S> + Unpin> InitializingFuture<S, T> {
     /// context thread, this helper function spawns a task on the contex thread
     /// using a reference to the [`PulseContextWrapper`], and returns the
     /// result.
-    pub async fn await_on(self, ctx_wrap: &PulseContextWrapper) -> Result<T, S> {
-        ctx_wrap.spawn(async move { self.await }).await
+    pub async fn await_on(
+        self,
+        ctx_wrap: &PulseContextWrapper
+    ) -> Result<T, S> {
+        ctx_wrap.spawn(async move { self.await }).await.await
             .expect("Entity initialization task unexpectedly failed")
     }
 }

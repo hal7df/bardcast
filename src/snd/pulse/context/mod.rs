@@ -137,7 +137,7 @@ impl PulseContextWrapper {
     /// If the operation works with context operations that return an
     /// asynchronous [`Operation`] handle, use
     /// [`PulseContextWrapper::do_ctx_op`] and its cohort instead.
-    pub async fn with_ctx<F, T>(&self, op: F) -> T
+    pub async fn with_ctx<F, T: Send + 'static>(&self, op: F) -> T
     where F: FnOnce(&mut Context) -> T + Send + 'static {
         let (tx, rx) = oneshot::channel::<T>();
 
@@ -151,7 +151,7 @@ impl PulseContextWrapper {
     }
 
     /// Spawns a task to execute the given future on the context thread.
-    pub async fn spawn<T>(
+    pub async fn spawn<T: Send + 'static>(
         &self,
         fut: impl Future<Output = T> + Send + 'static
     ) -> JoinHandle<T> {

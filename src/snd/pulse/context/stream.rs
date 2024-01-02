@@ -90,11 +90,11 @@ pub type SampleConsumer = Consumer<u8>;
 
 // TYPE IMPLS ******************************************************************
 impl StreamManager {
-    pub fn new(ctx: PulseContextWrapper) -> (Self, Consumer<u8>) {
+    pub fn new(ctx: &PulseContextWrapper) -> (Self, Consumer<u8>) {
         let (tx, rx) = AsyncRb::<u8, HeapRb<u8>>::new(SAMPLE_QUEUE_SIZE).split();
 
         (Self {
-            ctx,
+            ctx: ctx.clone(),
             sample_tx: Lessor::new(tx),
             task: None,
         }, rx)

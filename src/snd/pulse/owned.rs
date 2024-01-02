@@ -4,6 +4,7 @@
 extern crate libpulse_binding as libpulse;
 
 use std::borrow::Cow;
+use std::fmt::{Display, Error as FormatError, Formatter};
 
 use libpulse::channelmap::Map as ChannelMap;
 use libpulse::context::introspect::{SinkInfo, SinkInputInfo, SourceInfo};
@@ -13,6 +14,8 @@ use libpulse::proplist::Proplist;
 use libpulse::sample::Spec;
 use libpulse::time::MicroSeconds;
 use libpulse::volume::{ChannelVolumes, Volume};
+
+const UNKNOWN_ENTITY_LABEL: String = String::from("[unknown]");
 
 // TYPE DEFINITIONS ************************************************************
 
@@ -177,6 +180,24 @@ impl From<&SourceInfo<'_>> for OwnedSourceInfo {
     }
 }
 
+impl Display for OwnedSinkInfo {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), FormatError> {
+        fmt_name_or_index(f, self.name.as_ref(), self.index)
+    }
+}
+
+impl Display for OwnedSinkInputInfo {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), FormatError> {
+        fmt_name_or_index(f, self.name.as_ref(), self.index)
+    }
+}
+
+impl Display for OwnedSourceInfo {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), FormatError> {
+        fmt_name_or_index(f, self.name.as_ref(), self.index)
+    }
+}
+
 impl IntoOwnedInfo for SinkInfo<'_> {
     type Owned = OwnedSinkInfo;
 
@@ -206,4 +227,12 @@ impl IntoOwnedInfo for SourceInfo<'_> {
 /// Maps an optional copy-on-write `str` into an optional owned `String`.
 fn map_opt_str(orig: Option<&Cow<'_, str>>) -> Option<String> {
     orig.map(|orig_str| orig_str.to_string())
+}
+
+fn fmt_name_or_index(
+    f: &mut Formatter<'_>,
+    name: Option<&String>,
+    index: u32
+) -> Result<(), FormatError> {
+    write!(f, "{} (index {})", name.unwrap_or(&UNKNOWN_ENTITY_LABEL), index)
 }
