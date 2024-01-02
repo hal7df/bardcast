@@ -8,24 +8,28 @@
 
 extern crate libpulse_binding as libpulse;
 
+use std::collections::{HashMap, VecDeque};
 use std::error::Error;
 use std::fmt::{Display, Error as FormatError, Formatter};
 use std::process;
 
 use async_trait::async_trait;
 use clap::crate_name;
-use futures::future;
-use log::{debug, error, warn};
+use futures::future::{self, TryFutureExt};
+use log::{debug, error, info, warn};
 
 use libpulse::error::Code;
 
-use super::context::AsyncIntrospector;
-use super::context::stream::StreamManager;
+use super::context::{AsyncIntrospector, PulseContextWrapper};
+use super::context::stream::{SampleConsumer, StreamManager};
 use super::event::EventListener;
 use super::owned::{OwnedSinkInfo, OwnedSinkInputInfo};
 
-const TEARDOWN_FAILURE_WARNING: &'static str = "Application audio may not work correctly. Please check your system audio configuration.";
-const SINK_INPUT_MOVE_FAILURE: &'static str = "Some captured inputs failed to move to their original or default sink.";
+const TEARDOWN_FAILURE_WARNING: &'static str =
+    "Application audio may not work correctly. Please check your system audio \
+     configuration.";
+const SINK_INPUT_MOVE_FAILURE: &'static str =
+    "Some captured inputs failed to move to their original or default sink.";
 
 // TYPE DEFINITIONS ************************************************************
 
@@ -51,7 +55,7 @@ pub trait Interceptor: Send + Sync {
     /// Starts recording audio from the given application.
     async fn record(
         &mut self,
-        source: OwnedSinkInputInfo
+        source: &OwnedSinkInputInfo
     ) -> Result<(), InterceptError>;
 
     /// Stops recording audio from the given application. If this interceptor
@@ -72,7 +76,7 @@ pub trait Interceptor: Send + Sync {
 
     /// Returns the number of applications that have been intercepted by this
     /// interceptor.
-    async fn len(&self) -> Result<usize, Code>;
+    fn len(&self) -> usize;
 
     /// Gracefully closes any system resources that were created by the
     /// `Interceptor`, returning any intercepted streams to another audio device
@@ -85,8 +89,7 @@ pub trait Interceptor: Send + Sync {
 
 /// Specialization of [`Interceptor`] that allows for limits on the number of
 /// concurrently captured applications.
-#[async_trait]
-pub trait LimitedInterceptor: Interceptor {
+pub trait LimitingInterceptor: Interceptor {
     /// Returns the number of concurrent applications that can be intercepted
     /// by this `LimitedInterceptor` instance.
     ///
@@ -97,58 +100,98 @@ pub trait LimitedInterceptor: Interceptor {
     /// intercepted by this `LimitedInterceptor` instance.
     ///
     /// Returns `Ok(None)` if there is no limit applied to this interceptor.
-    async fn remaining(&self) -> Result<Option<usize>, Code> {
-        if let Some(capacity) = self.capacity() {
-            self.len().await.map(|size| Some(capacity - size))
-        } else {
-            Ok(None)
-        }
+    fn remaining(&self) -> Option<usize> {
+        self.capacity().map(|capacity| capacity - self.len())
     }
 
     /// Determines whether this interceptor has intercepted the maximum number
     /// of concurrent applications.
     ///
     /// This will always be `Ok(false)` for interceptors with no limit.
-    async fn is_full(&self) -> Result<bool, Code> {
-        if let Some(capacity) = self.capacity() {
-            self.len().await.map(|size| size == capacity)
-        } else {
-            Ok(false)
-        }
+    fn is_full(&self) -> bool {
+        self.remaining().is_some_and(|remaining| remaining == 0)
     }
+}
+
+struct InputState {
+    orig_sink: u32,
+    corked: bool,
+}
+
+pub struct SingleInputMonitor {
+    stream_manager: StreamManager,
+    captured: Option<OwnedSinkInputInfo>,
+    volume: Option<f64>,
 }
 
 /// Implementation of [`Interceptor`] that captures application audio in a
 /// dedicated audio sink, preventing it from reaching any hardware audio
 /// devices.
 pub struct CapturingInterceptor {
-    introspect: AsyncIntrospector,
     rec: OwnedSinkInfo,
+    stream_manager: StreamManager,
+    captures: HashMap<u32, InputState>,
+    introspect: AsyncIntrospector,
+    volume: Option<f64>,
+    limit: Option<usize>,
 }
 
 /// Implementation of [`Interceptor`] that duplicates application audio streams
 /// before reading them to allow the audio to reach a hardware sink in addition
 /// to being read by bardcast.
 pub struct DuplexingInterceptor {
-    introspect: AsyncIntrospector,
     demux: OwnedSinkInfo,
     rec: OwnedSinkInfo,
-    orig_idx: u32,
+    orig: OwnedSinkInfo,
+    stream_manager: StreamManager,
+    captures: HashMap<u32, InputState>,
+    introspect: AsyncIntrospector,
+    volume: Option<f64>,
+    limit: Option<usize>,
+}
+
+pub struct QueuedInterceptor<I> {
+    inner: I,
+    queue: VecDeque<OwnedSinkInputInfo>,
 }
 
 /// TYPE IMPLS *****************************************************************
+impl SingleInputMonitor {
+    pub async fn new(
+        ctx: &PulseContextWrapper,
+        volume: Option<f64>
+    ) -> (Self, SampleConsumer) {
+        let (stream_manager, stream) = StreamManager::new(ctx);
+
+        (Self {
+            stream_manager,
+            captured: None,
+            volume,
+        }, stream)
+    }
+}
+
 impl CapturingInterceptor {
     /// Creates a new `CapturingInterceptor`.
     pub async fn new(
-        introspect: &AsyncIntrospector,
-    ) -> Result<Self, Code> {
-        let rec_sink = create_rec_sink(introspect).await?;
-        debug!("Created rec sink at index {}", rec_sink.index);
+        ctx: &PulseContextWrapper,
+        volume: Option<f64>,
+        limit: Option<usize>
+    ) -> Result<(Self, SampleConsumer), Code> {
+        let introspect = AsyncIntrospector::from(ctx);
+        let rec = create_rec_sink(&introspect).await?;
+        debug!("Created rec sink at index {}", rec.index);
 
-        Ok(Self {
-            introspect: introspect.clone(),
-            rec: rec_sink,
-        })
+        let (stream_manager, stream) = StreamManager::new(ctx);
+
+        Ok((Self {
+            rec,
+            stream_manager,
+            captures: HashMap::new(),
+            introspect,
+            volume,
+            limit
+        }, stream))
     }
 }
 
@@ -156,32 +199,37 @@ impl DuplexingInterceptor {
     /// Creates a new `DuplexingInterceptor`, using the given sink as the second
     /// output.
     pub async fn from_sink(
-        introspect: &AsyncIntrospector,
+        ctx: &PulseContextWrapper,
         sink: &OwnedSinkInfo,
-    ) -> Result<Self, Code> {
-        let rec_sink = create_rec_sink(
-            introspect,
+        volume: Option<f64>,
+        limit: Option<usize>
+    ) -> Result<(Self, SampleConsumer), Code> {
+        let introspect = AsyncIntrospector::from(ctx);
+        let rec = create_rec_sink(&introspect).await?;
+        debug!("Created rec sink at index {}", rec.index);
+
+        let demux = tear_down_module_on_failure(
+            &introspect,
+            rec.owner_module,
+            create_demux_sink(
+                &introspect,
+                &[&rec, &sink],
+            ).await
         ).await?;
-        debug!("Created rec sink at index {}", rec_sink.index);
+        debug!("Created demux sink at index {}", demux.index);
 
-        let demux_sink = create_demux_sink(
+        let (stream_manager, stream) = StreamManager::new(ctx);
+
+        Ok((Self {
+            demux,
+            rec,
+            orig: sink.clone(),
+            stream_manager,
+            captures: HashMap::new(),
             introspect,
-            &[&rec_sink, &sink],
-        ).await;
-
-        let demux_sink = if let Some(mod_idx) = &rec_sink.owner_module {
-            tear_down_module_on_failure(introspect, *mod_idx, demux_sink).await?
-        } else {
-            demux_sink?
-        };
-        debug!("Created demux sink at index {}", demux_sink.index);
-
-        Ok(Self {
-            introspect: introspect.clone(),
-            demux: demux_sink,
-            rec: rec_sink,
-            orig_idx: sink.index,
-        })
+            volume,
+            limit
+        }, stream))
     }
 }
 
@@ -227,50 +275,71 @@ impl Error for InterceptError {
     }
 }
 
+impl<I: LimitingInterceptor> From<I> for QueuedInterceptor<I> {
+    fn from(interceptor: I) -> Self {
+        Self {
+            inner: interceptor,
+            queue: VecDeque::new(),
+        }
+    }
+}
+
 #[async_trait]
-impl Interceptor for CapturingInterceptor {
-    async fn intercept(&mut self, sink_input_id: u32) -> Result<(), Code> {
-       self.introspect.move_sink_input_by_index(
-           sink_input_id,
-           self.rec.index
-        ).await
+impl Interceptor for SingleInputMonitor {
+    async fn record(
+        &mut self,
+        source: &OwnedSinkInputInfo
+    ) -> Result<(), InterceptError> {
+        if self.captured.is_some() {
+            return Err(InterceptError::AtCapacity(1usize));
+        }
+
+        // Make sure there isn't a running stream already before starting it
+        debug!(
+            "Starting new PulseAudio stream targeting application `{}'",
+            source
+        );
+        self.stream_manager.stop().await;
+        self.stream_manager.start(source.clone(), self.volume).await?;
+
+        self.captured = Some(source.clone());
+
+        info!("Started monitor of application `{}'", source);
+
+        Ok(())
     }
 
-    fn source_name(&self) -> Result<String, Code> {
-        self.rec.monitor_source_name.clone().ok_or(Code::NoData)
+    async fn stop(&mut self, source_idx: u32) -> Result<bool, Code> {
+        if let Some(captured) = self.captured {
+            if source_idx != captured.index {
+                return Ok(false);
+            }
+
+            debug!("Stopping PulseAudio stream");
+            self.stream_manager.stop().await;
+            info!("Stopped monitor of application `{}'", captured);
+            self.captured = None;
+
+            Ok(true)
+        } else {
+            Ok(false)
+        }
     }
 
-    async fn len(&self) -> Result<usize, Code> {
-       self.introspect.sink_inputs_for_sink(
-           self.rec.index
-       ).await.map(|inputs| inputs.len())
+    fn needs_monitor(&self) -> bool {
+        self.stream_manager.is_running()
+    }
+
+    async fn monitor(&mut self) {
+        self.stream_manager.monitor().await;
+    }
+
+    fn len(&self) -> usize {
+        if self.captured.is_some() { 1usize } else { 0usize }
     }
 
     async fn close(mut self) {
-        if let Ok(inputs) = self.introspect.sink_inputs_for_sink(self.rec.index).await {
-            let default_sink = self.introspect.get_default_sink().await.map(|sink| sink.index);
-
-            if let Ok(default_sink) = default_sink {
-                if !move_sink_inputs_to_sink(
-                    &self.introspect,
-                    inputs.iter().map(|input| input.index),
-                    default_sink
-                ).await {
-                    warn!("{} {}", SINK_INPUT_MOVE_FAILURE, TEARDOWN_FAILURE_WARNING);
-                }
-            } else {
-                warn!("Failed to determine default sink. {}", TEARDOWN_FAILURE_WARNING);
-            }
-        } else {
-            warn!(
-                "Failed to determine inputs for rec sink at index {}. {} {}",
-                self.rec.index,
-                SINK_INPUT_MOVE_FAILURE,
-                TEARDOWN_FAILURE_WARNING
-            );
-        }
-
-        tear_down_virtual_sink(&self.introspect, &self.rec).await;
+        self.stream_manager.stop().await;
     }
 
     async fn boxed_close(mut self: Box<Self>) {
@@ -278,46 +347,285 @@ impl Interceptor for CapturingInterceptor {
     }
 }
 
+impl LimitingInterceptor for SingleInputMonitor {
+    fn capacity(&self) -> Option<usize> {
+        Some(1usize)
+    }
+}
+
 #[async_trait]
-impl Interceptor for DuplexingInterceptor {
-    async fn intercept(&mut self, sink_input_id: u32) -> Result<(), Code> {
+impl Interceptor for CapturingInterceptor {
+    async fn record(
+        &mut self,
+        source: &OwnedSinkInputInfo
+    ) -> Result<(), InterceptError> {
+        if self.is_full() {
+            // limit is guaranteed to be Some if is_full() returns true
+            return Err(InterceptError::AtCapacity(self.limit.unwrap()));
+        }
+
+        if !self.stream_manager.is_running() {
+            debug!("Starting PulseAudio stream");
+            self.stream_manager.start(
+                self.rec.clone(),
+                self.volume
+            ).await?;
+        }
+
         self.introspect.move_sink_input_by_index(
-            sink_input_id,
-            self.demux.index
-        ).await
+            source.index,
+            self.rec.index
+        ).await?;
+
+        self.captures.insert(source.index, InputState {
+            orig_sink: source.sink,
+            corked: source.corked,
+        });
+
+        info!("Intercepted application `{}'", source);
+
+        Ok(())
     }
 
-    fn source_name(&self) -> Result<String, Code> {
-        self.rec.monitor_source_name.clone().ok_or(Code::NoData)
+    async fn stop(&mut self, source_idx: u32) -> Result<bool, Code> {
+        if let Some(capture) = self.captures.get(&source_idx) {
+            let target_sink = get_sink_or_default(
+                &self.introspect,
+                capture.orig_sink
+            ).await?;
+
+            self.introspect.move_sink_input_by_index(
+                source_idx,
+                target_sink.index
+            ).await?;
+
+            self.captures.remove(&source_idx);
+
+            info!("Stopped intercept of application with index {}", source_idx);
+
+            if self.captures.is_empty() {
+                debug!("Stopping PulseAudio stream");
+                self.stream_manager.stop();
+            }
+
+            Ok(true)
+        } else {
+            Ok(false)
+        }
     }
 
-    async fn len(&self) -> Result<usize, Code> {
-        self.introspect.sink_inputs_for_sink(
-            self.demux.index
-        ).await.map(|inputs| inputs.len())
+    fn needs_monitor(&self) -> bool {
+        self.stream_manager.is_running()
+    }
+
+    async fn monitor(&mut self) {
+        self.stream_manager.monitor().await;
+    }
+
+    fn len(&self) -> usize {
+        self.captures.len()
     }
 
     async fn close(mut self) {
-        if let Ok(inputs) = self.introspect.sink_inputs_for_sink(self.demux.index).await {
-            if !move_sink_inputs_to_sink(
-                &self.introspect,
-                inputs.iter().map(|input| input.index),
-                self.orig_idx
-            ).await {
-                warn!("{} {}", SINK_INPUT_MOVE_FAILURE, TEARDOWN_FAILURE_WARNING);
-            }
-        } else {
-            warn!(
-                "Failed to determine inputs for demux sink at index {}. {} {}",
-                self.demux.index,
-                SINK_INPUT_MOVE_FAILURE,
-                TEARDOWN_FAILURE_WARNING
-            );
+        interceptor_stop_all(
+            &mut self,
+            self.captures.keys().copied().collect::<Vec<u32>>()
+        ).await;
+        tear_down_virtual_sink(&self.introspect, &self.rec, None).await;
+    }
+
+    async fn boxed_close(mut self: Box<Self>) {
+        self.close().await;
+    }
+}
+
+impl LimitingInterceptor for CapturingInterceptor {
+    fn capacity(&self) -> Option<usize> {
+        self.limit
+    }
+}
+
+#[async_trait]
+impl Interceptor for DuplexingInterceptor {
+    async fn record(
+        &mut self,
+        source: &OwnedSinkInputInfo
+    ) -> Result<(), InterceptError> {
+        if self.is_full() {
+            // limit is guaranteed to be Some if is_full() returns true
+            return Err(InterceptError::AtCapacity(self.limit.unwrap()));
         }
 
+        if !self.stream_manager.is_running() {
+            debug!("Starting PulseAudio stream");
+            self.stream_manager.start(
+                self.rec.clone(),
+                self.volume
+            ).await?;
+        }
+
+        self.introspect.move_sink_input_by_index(
+            source.index,
+            self.demux.index
+        ).await?;
+
+        self.captures.insert(source.index, InputState {
+            orig_sink: source.sink,
+            corked: source.corked,
+        });
+
+        info!("Intercepted application `{}'", source);
+
+        Ok(())
+    }
+
+    async fn stop(&mut self, source_idx: u32) -> Result<bool, Code> {
+        if let Some(capture) = self.captures.get(&source_idx) {
+            let target_sink = get_sink_or_default(
+                &self.introspect,
+                capture.orig_sink
+            ).await?;
+
+            self.introspect.move_sink_input_by_index(
+                source_idx,
+                target_sink.index
+            ).await?;
+
+            self.captures.remove(&source_idx);
+
+            info!("Stopped intercept of application with index {}", source_idx);
+
+            if self.captures.is_empty() {
+                debug!("Stopping PulseAudio stream");
+                self.stream_manager.stop().await;
+            }
+
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    fn needs_monitor(&self) -> bool {
+        self.stream_manager.is_running()
+    }
+
+    async fn monitor(&mut self) {
+        self.stream_manager.monitor().await;
+    }
+
+    fn len(&self) -> usize {
+        self.captures.len()
+    }
+
+    async fn close(mut self) {
+        interceptor_stop_all(
+            &mut self,
+            self.captures.keys().copied().collect::<Vec<u32>>()
+        ).await;
+
         //Tear down demux and rec sinks
-        tear_down_virtual_sink(&self.introspect, &self.demux).await;
-        tear_down_virtual_sink(&self.introspect, &self.rec).await;
+        tear_down_virtual_sink(
+            &self.introspect,
+            &self.demux,
+            Some(&self.orig)
+        ).await;
+        tear_down_virtual_sink(
+            &self.introspect,
+            &self.rec,
+            Some(&self.orig)
+        ).await;
+    }
+
+    async fn boxed_close(mut self: Box<Self>) {
+        self.close().await;
+    }
+}
+
+impl LimitingInterceptor for DuplexingInterceptor {
+    fn capacity(&self) -> Option<usize> {
+        self.limit
+    }
+}
+
+#[async_trait]
+impl<I: LimitingInterceptor> Interceptor for QueuedInterceptor<I> {
+    async fn record(
+        &mut self,
+        source: &OwnedSinkInputInfo
+    ) -> Result<(), InterceptError> {
+        match self.inner.record(source).await {
+            Ok(()) => Ok(()),
+            Err(InterceptError::AtCapacity(n)) => {
+                info!(
+                    "Hit application intercept limit ({}). Queueing \
+                     application `{}' for later intercept.",
+                     n,
+                     source
+                );
+
+                self.queue.push_back(source.clone());
+                Ok(())
+            },
+            Err(InterceptError::PulseError(e)) => Err(
+                InterceptError::PulseError(e)
+            ),
+        }
+    }
+
+    async fn stop(
+        &mut self,
+        source_idx: u32
+    ) -> Result<bool, Code> {
+        self.queue.retain(|source| {
+            if source.index == source_idx {
+                info!(
+                    "Removing application `{}' from intercept queue",
+                    source
+                );
+                false
+            } else {
+                true
+            }
+        });
+
+        if self.inner.stop(source_idx).await? {
+            if let Some(next_source) = self.queue.pop_front() {
+                info!(
+                    "Attempting to intercept previously queued application `{}'",
+                    next_source
+                );
+
+                match self.record(&next_source).await {
+                    Ok(()) => Ok(true),
+                    Err(InterceptError::PulseError(e)) => Err(e),
+                    Err(InterceptError::AtCapacity(_)) => unreachable!(
+                        "QueuedInterceptor::record() should never return \
+                         InterceptError::AtCapacity"
+                    ),
+                }
+            } else {
+                Ok(true)
+            }
+        } else {
+            Ok(false)
+        }
+    }
+
+    fn needs_monitor(&self) -> bool {
+        self.inner.needs_monitor()
+    }
+
+    async fn monitor(&mut self) {
+        self.inner.monitor().await;
+    }
+
+    fn len(&self) -> usize {
+        self.inner.len()
+    }
+
+    async fn close(mut self) {
+        self.inner.close().await
     }
 
     async fn boxed_close(mut self: Box<Self>) {
@@ -370,34 +678,6 @@ async fn get_unique_sink_name(
     Ok(format!("{}-{}", sink_name_template, matching_sink_count))
 }
 
-/// Unloads a virtual sink by its module index.
-async fn tear_down_virtual_sink_module(
-    introspect: &AsyncIntrospector,
-    mod_idx: u32
-) -> Result<(), Code> {
-    debug!("Tearing down virtual sink owned by module {}", mod_idx);
-    introspect.unload_module(mod_idx).await?;
-    debug!("Virtual sink torn down");
-
-    Ok(())
-}
-
-/// Unloads a virtual sink by its module index if the given `op_result` is
-/// `Err`, returning the given result on success, or bubbling up a new error on
-/// failure.
-async fn tear_down_module_on_failure<T>(
-    introspect: &AsyncIntrospector,
-    mod_idx: u32,
-    op_result: Result<T, Code>
-) -> Result<T, Code> {
-    if op_result.is_err() {
-        debug!("Tearing down virtual sink module with index {} due to initialization failure", mod_idx);
-        tear_down_virtual_sink_module(introspect, mod_idx).await?;
-    }
-
-    op_result
-}
-
 /// Gets the metadata for a virtual sink based on its name and owning module
 /// index.
 async fn get_created_virtual_sink<S: ToString>(
@@ -419,6 +699,53 @@ async fn get_created_virtual_sink<S: ToString>(
         .next().ok_or(Code::NoEntity)
 }
 
+async fn get_sink_or_default(
+    introspect: &AsyncIntrospector,
+    sink_idx: u32
+) -> Result<OwnedSinkInfo, Code> {
+    introspect.get_sink_by_index(sink_idx).or_else(|err| async move {
+        if err == Code::NoEntity {
+            introspect.get_default_sink().await
+        } else {
+            future::err::<OwnedSinkInfo, Code>(err).await
+        }
+    }).await
+}
+
+/// Unloads a virtual sink by its module index.
+async fn tear_down_virtual_sink_module(
+    introspect: &AsyncIntrospector,
+    mod_idx: u32
+) -> Result<(), Code> {
+    debug!("Tearing down virtual sink owned by module {}", mod_idx);
+    introspect.unload_module(mod_idx).await?;
+    debug!("Virtual sink torn down");
+
+    Ok(())
+}
+
+/// Unloads a virtual sink by its module index if the given `op_result` is
+/// `Err`, returning the given result on success, or bubbling up a new error on
+/// failure.
+async fn tear_down_module_on_failure<T>(
+    introspect: &AsyncIntrospector,
+    mod_idx: Option<u32>,
+    op_result: Result<T, Code>
+) -> Result<T, Code> {
+    if let Some(mod_idx) = mod_idx {
+        if op_result.is_err() {
+            debug!(
+                "Tearing down virtual sink module with index {} due to \
+                 initialization failure",
+                mod_idx
+            );
+            tear_down_virtual_sink_module(introspect, mod_idx).await?;
+        }
+    }
+
+    op_result
+}
+
 /// Creates a virtual audio sink dedicated for recording audio. No audio sent to
 /// this sink is sent to any other audio devices on the system.
 async fn create_rec_sink(
@@ -433,7 +760,7 @@ async fn create_rec_sink(
 
     tear_down_module_on_failure(
         introspect,
-        mod_idx,
+        Some(mod_idx),
         get_created_virtual_sink(introspect, sink_name, mod_idx).await
     ).await
 }
@@ -467,32 +794,24 @@ async fn create_demux_sink(
 
     tear_down_module_on_failure(
         introspect,
-        mod_idx,
+        Some(mod_idx),
         get_created_virtual_sink(introspect, sink_name, mod_idx).await
     ).await
 }
 
-/// Tears down the virtual sink described by the given metadata.
-async fn tear_down_virtual_sink(
-    introspect: &AsyncIntrospector,
-    sink: &OwnedSinkInfo
+async fn interceptor_stop_all(
+    interceptor: &mut impl Interceptor,
+    inputs: impl IntoIterator<Item = u32>
 ) {
-    if let Some(owner_module) = sink.owner_module {
-        if let Err(e) = tear_down_virtual_sink_module(
-            introspect,
-            owner_module
-        ).await {
-            error!(
-                "Failed to tear down virtual sink at index {}: {}",
-                sink.index,
-                e
+    for input in inputs {
+        if let Err(e) = interceptor.stop(input).await {
+            warn!(
+                "{} (error {}) {}",
+                SINK_INPUT_MOVE_FAILURE,
+                e,
+                TEARDOWN_FAILURE_WARNING
             );
         }
-    } else {
-        warn!(
-            "Failed to tear down virtual sink at index {} as it does not have an owner module",
-            sink.index
-        );
     }
 }
 
@@ -511,5 +830,89 @@ where I: Iterator<Item = u32> {
         );
         introspect.move_sink_input_by_index(input, target_sink_idx)
     })).await.iter().map(|res| res.is_ok()).fold(true, |acc, x| acc && x)
+}
+
+/// Tears down the virtual sink described by the given metadata.
+///
+/// Any sink inputs still attached to the sink will be moved to the sink
+/// described by `move_target`, or the default sink, if no such sink is
+/// provided.
+async fn tear_down_virtual_sink(
+    introspect: &AsyncIntrospector,
+    sink: &OwnedSinkInfo,
+    move_target: Option<&OwnedSinkInfo>
+) {
+    // Step 1: Move any lingering sink inputs to another sink
+    match introspect.sink_inputs_for_sink(sink.index).await {
+        Ok(inputs) => {
+            if !inputs.is_empty() {
+                warn!(
+                    "{0} detected unknown applications attached to sink `{1}'. \
+                     This sink is managed automatically by {0}; please avoid \
+                     manually attaching applications to this sink using system \
+                     audio utilities.",
+                    crate_name!(),
+                    sink
+                );
+
+                let move_target = if let Some(sink) = move_target {
+                    Ok(sink.clone())
+                } else {
+                    introspect.get_default_sink().await
+                };
+
+                match move_target {
+                    Ok(move_target) => {
+                        if !move_sink_inputs_to_sink(
+                            introspect,
+                            inputs.iter().map(|input| input.index),
+                            move_target.index
+                        ).await {
+                            warn!(
+                                "{} {}",
+                                SINK_INPUT_MOVE_FAILURE,
+                                TEARDOWN_FAILURE_WARNING
+                            );
+                        }
+                    },
+                    Err(e) => warn!(
+                        "Failed to determine target sink for applications \
+                         currently attached to sink `{}', which will be\
+                         destroyed (error: {}). {}",
+                        sink,
+                        e,
+                        TEARDOWN_FAILURE_WARNING
+                    )
+
+                }
+            }
+        },
+        Err(e) => warn!(
+            "Failed to determine applications still attached to sink `{}' \
+             error {}). {}",
+            sink,
+            e,
+            TEARDOWN_FAILURE_WARNING
+        ),
+    }
+
+    // Step 2: Tear down the sink
+    if let Some(owner_module) = sink.owner_module {
+        if let Err(e) = tear_down_virtual_sink_module(
+            introspect,
+            owner_module
+        ).await {
+            error!(
+                "Failed to tear down virtual sink at index {}: {}",
+                sink.index,
+                e
+            );
+        }
+    } else {
+        warn!(
+            "Failed to tear down virtual sink at index {} as it does not have an owner module",
+            sink.index
+        );
+    }
 }
 
