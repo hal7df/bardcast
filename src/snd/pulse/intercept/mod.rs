@@ -9,6 +9,7 @@
 mod concrete;
 mod util;
 
+use std::borrow::Cow;
 use std::error::Error;
 use std::fmt::{Display, Error as FormatError, Formatter};
 
@@ -27,13 +28,13 @@ const SINK_INPUT_MOVE_FAILURE: &'static str =
 // TYPE DEFINITIONS ************************************************************
 /// Represents possible error modes for [`Interceptor::record()`].
 #[derive(Debug)]
-pub enum InterceptError {
+pub enum InterceptError<'a> {
     /// PulseAudio returned an error while attempting to intercept the
     /// application.
     PulseError(Code),
 
     /// The interceptor cannot concurrently intercept any more applications.
-    AtCapacity(usize),
+    AtCapacity(usize, Cow<'a, OwnedSinkInputInfo>),
 }
 
 /// Core abstraction for intercepting application audio.
@@ -45,10 +46,10 @@ pub enum InterceptError {
 #[async_trait]
 pub trait Interceptor: Send + Sync {
     /// Starts recording audio from the given application.
-    async fn record(
+    async fn record<'a>(
         &mut self,
-        source: &OwnedSinkInputInfo
-    ) -> Result<(), InterceptError>;
+        source: Cow<'a, OwnedSinkInputInfo>
+    ) -> Result<(), InterceptError<'a>>;
 
     /// Updates the stream metadata for the given captured stream. This may
     /// cork or uncork the stream depending on the cork state of all captured
@@ -114,14 +115,14 @@ pub trait LimitingInterceptor: Interceptor {
 }
 
 // TRAIT IMPLS *****************************************************************
-impl From<Code> for InterceptError {
+impl From<Code> for InterceptError<'_> {
     fn from(code: Code) -> Self {
         Self::PulseError(code)
     }
 }
 
-impl TryFrom<InterceptError> for Code {
-    type Error = InterceptError;
+impl<'a> TryFrom<InterceptError<'a>> for Code {
+    type Error = InterceptError<'a>;
 
     fn try_from(err: InterceptError) -> Result<Self, Self::Error> {
         if let InterceptError::PulseError(code) = err {
@@ -132,20 +133,21 @@ impl TryFrom<InterceptError> for Code {
     }
 }
 
-impl Display for InterceptError {
+impl Display for InterceptError<'_> {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), FormatError> {
         match self {
             Self::PulseError(code) => code.fmt(f),
-            Self::AtCapacity(limit) => write!(
+            Self::AtCapacity(limit, source) => write!(
                 f,
-                "Interceptor at limit ({})",
+                "Cannot intercept application {}, interceptor at limit ({})",
+                source.as_ref(),
                 limit
             ),
         }
     }
 }
 
-impl Error for InterceptError {
+impl Error for InterceptError<'_> {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         if let Self::PulseError(code) = self {
             Some(&code)

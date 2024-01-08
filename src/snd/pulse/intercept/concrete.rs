@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::{HashMap, VecDeque};
 
 use async_trait::async_trait;
@@ -142,13 +143,15 @@ impl<I: LimitingInterceptor> From<I> for QueuedInterceptor<I> {
 
 #[async_trait]
 impl Interceptor for SingleInputMonitor {
-    async fn record(
+    async fn record<'a>(
         &mut self,
-        source: &OwnedSinkInputInfo
-    ) -> Result<(), InterceptError> {
+        source: Cow<'a, OwnedSinkInputInfo>
+    ) -> Result<(), InterceptError<'a>> {
         if self.captured.is_some() {
-            return Err(InterceptError::AtCapacity(1usize));
+            return Err(InterceptError::AtCapacity(1usize, source));
         }
+
+        let source = source.into_owned();
 
         // Make sure there isn't a running stream already before starting it
         debug!(
@@ -158,7 +161,7 @@ impl Interceptor for SingleInputMonitor {
         self.stream_manager.stop().await;
         self.stream_manager.start(source.clone(), self.volume).await?;
 
-        self.captured = Some(source.clone());
+        self.captured = Some(source);
 
         info!("Started monitor of application `{}'", source);
 
@@ -227,13 +230,16 @@ impl LimitingInterceptor for SingleInputMonitor {
 
 #[async_trait]
 impl Interceptor for CapturingInterceptor {
-    async fn record(
+    async fn record<'a>(
         &mut self,
-        source: &OwnedSinkInputInfo
-    ) -> Result<(), InterceptError> {
+        source: Cow<'a, OwnedSinkInputInfo>
+    ) -> Result<(), InterceptError<'a>> {
         if self.is_full() {
             // limit is guaranteed to be Some if is_full() returns true
-            return Err(InterceptError::AtCapacity(self.limit.unwrap()));
+            return Err(InterceptError::AtCapacity(
+                self.limit.unwrap(),
+                source
+            ));
         }
 
         if !self.stream_manager.is_running() {
@@ -245,13 +251,13 @@ impl Interceptor for CapturingInterceptor {
         }
 
         self.introspect.move_sink_input_by_index(
-            source.index,
+            source.as_ref().index,
             self.rec.index
         ).await?;
 
         self.captures.insert(source.index, InputState {
-            orig_sink: source.sink,
-            corked: source.corked,
+            orig_sink: source.as_ref().sink,
+            corked: source.as_ref().corked,
         });
 
         info!("Intercepted application `{}'", source);
@@ -338,13 +344,16 @@ impl LimitingInterceptor for CapturingInterceptor {
 
 #[async_trait]
 impl Interceptor for DuplexingInterceptor {
-    async fn record(
+    async fn record<'a>(
         &mut self,
-        source: &OwnedSinkInputInfo
-    ) -> Result<(), InterceptError> {
+        source: Cow<'a, OwnedSinkInputInfo>
+    ) -> Result<(), InterceptError<'a>> {
         if self.is_full() {
             // limit is guaranteed to be Some if is_full() returns true
-            return Err(InterceptError::AtCapacity(self.limit.unwrap()));
+            return Err(InterceptError::AtCapacity(
+                self.limit.unwrap(),
+                source
+            ));
         }
 
         if !self.stream_manager.is_running() {
@@ -356,13 +365,13 @@ impl Interceptor for DuplexingInterceptor {
         }
 
         self.introspect.move_sink_input_by_index(
-            source.index,
+            source.as_ref().index,
             self.demux.index
         ).await?;
 
         self.captures.insert(source.index, InputState {
-            orig_sink: source.sink,
-            corked: source.corked,
+            orig_sink: source.as_ref().sink,
+            corked: source.as_ref().corked,
         });
 
         info!("Intercepted application `{}'", source);
@@ -460,21 +469,20 @@ impl LimitingInterceptor for DuplexingInterceptor {
 
 #[async_trait]
 impl<I: LimitingInterceptor> Interceptor for QueuedInterceptor<I> {
-    async fn record(
+    async fn record<'a>(
         &mut self,
-        source: &OwnedSinkInputInfo
-    ) -> Result<(), InterceptError> {
+        source: Cow<'a, OwnedSinkInputInfo>
+    ) -> Result<(), InterceptError<'a>> {
         match self.inner.record(source).await {
             Ok(()) => Ok(()),
-            Err(InterceptError::AtCapacity(n)) => {
+            Err(InterceptError::AtCapacity(n, source)) => {
                 info!(
                     "Hit application intercept limit ({}). Queueing \
                      application `{}' for later intercept.",
                      n,
                      source
                 );
-
-                self.queue.push_back(source.clone());
+                self.queue.push_back(source.into_owned());
                 Ok(())
             },
             Err(InterceptError::PulseError(e)) => Err(
@@ -517,10 +525,10 @@ impl<I: LimitingInterceptor> Interceptor for QueuedInterceptor<I> {
                     next_source
                 );
 
-                match self.record(&next_source).await {
+                match self.record(Cow::Owned(next_source)).await {
                     Ok(()) => Ok(true),
                     Err(InterceptError::PulseError(e)) => Err(e),
-                    Err(InterceptError::AtCapacity(_)) => unreachable!(
+                    Err(InterceptError::AtCapacity(..)) => unreachable!(
                         "QueuedInterceptor::record() should never return \
                          InterceptError::AtCapacity"
                     ),
