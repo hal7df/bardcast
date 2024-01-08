@@ -115,6 +115,12 @@ pub struct Args {
     #[clap(short = 'j', long)]
     pub threads: Option<usize>,
 
+    /// Number of appliations that can be captured concurrently.
+    ///
+    /// Ignored if -E/--stream-regex is not set
+    #[clap(short = 'n', long)]
+    pub intercept_limit: Option<usize>,
+
     /// Application verbosity level. One of "off", "error", "warn", "info",
     /// "debug", or "trace". If not specified, this will default to "info".
     #[clap(long)]
@@ -333,14 +339,18 @@ impl ApplicationConfig {
     /// This will only be called after all config merges are complete.
     pub fn validate_semantics(&self, action: Action) -> Result<(), String> {
         if let Action::Run(consumer) = action {
-            if self.output_file.is_some() && !consumer.needs_output_file() {
-                //This function may be called before the logging system is
-                //initialized, so use eprintln directly instead.
-                eprintln!("-o/--output-file does not make sense with the selected audio consumer, ignoring");
-            } else if self.output_file.is_none() && consumer.needs_output_file() {
-                return Err(String::from("Selected audio consumer requires an output file to be specified"));
+            #[cfg(feature = "wav")]
+            {
+                if self.output_file.is_some() && !consumer.needs_output_file() {
+                    //This function may be called before the logging system is
+                    //initialized, so use eprintln directly instead.
+                    eprintln!("-o/--output-file does not make sense with the selected audio consumer, ignoring");
+                } else if self.output_file.is_none() && consumer.needs_output_file() {
+                    return Err(String::from("Selected audio consumer requires an output file to be specified"));
+                }
             }
 
+            #[cfg(all(target_family = "unix", feature = "pulse"))]
             self.pulse.validate_semantics(action)?;
             self.discord.validate_semantics(action)
         } else if action == Action::ListServers {
