@@ -10,7 +10,7 @@ extern crate libpulse_binding as libpulse;
 use std::cmp;
 use std::future::Future;
 use std::mem;
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use clap::crate_name;
@@ -35,7 +35,6 @@ use libpulse::operation::{Operation, State as OperationState};
 use libpulse::sample::{Format as SampleFormat, Spec as SampleSpec};
 
 use self::async_polyfill::InitializingFuture;
-use crate::util;
 use crate::util::task::{ControlledJoinHandle, ValueJoinHandle};
 
 // RE-EXPORTS ******************************************************************
@@ -168,71 +167,17 @@ impl PulseContextWrapper {
     where
         T: Send + 'static,
         S: ?Sized + 'static,
-        F: FnOnce(&mut Context, Weak<Mutex<T>>) -> Operation<S> + Send + 'static {
-        let (tx, rx) = oneshot::channel::<Result<T, OperationState>>();
-
-        self.submit(move |ctx| {
-            let value = Arc::new(Mutex::new(initial_value));
-            let op = Arc::new(Mutex::new(Some(op(ctx, Arc::downgrade(&value)))));
-
-            let mut op_ref = Arc::clone(&op);
-            let mut tx = Some(tx);
-            let mut result = Some(value);
-
-            op.lock().unwrap().as_mut().unwrap().set_state_callback(Some(Box::new(move || {
-                let state = op_ref.lock().unwrap().as_ref().map(
-                    Operation::get_state
-                );
-
-                match state {
-                    Some(OperationState::Done) => {
-                        // There should never be any other strong references to
-                        // the value when this runs, so just try to unwrap it 
-                        if let Some(result) = mem::take(&mut result).map(Arc::into_inner).flatten() {
-                            let result = result.into_inner().unwrap();
-
-                            if util::opt_oneshot_try_send(&mut tx, Ok(result)).is_err() {
-                                warn!("Failed to report operation result, receiver dropped");
-                            }
-                        } else {
-                            warn!("Could not acquire context result");
-                            
-                            if util::opt_oneshot_try_send(
-                                &mut tx,
-                                Err(OperationState::Done)
-                            ).is_err() {
-                                warn!("Failed to report operation result, receiver dropped");
-                            }
-                        }
-                    },
-                    Some(OperationState::Cancelled) | None => {
-                        if state.is_none() {
-                            warn!("Operation handle dropped during callback execution");
-                        }
-
-                        if util::opt_oneshot_try_send(
-                            &mut tx,
-                            Err(OperationState::Cancelled)
-                        ).is_err() {
-                            warn!("Failed to report operation result, receiver dropped");
-                        }
-                    }
-                    Some(state) => debug!(
-                        "Context handler ignoring state change to {:?}",
-                        state
-                    ),
-                }
-
-                if tx.is_none() {
-                    mem::drop(mem::take(&mut op_ref));
-                }
-            })));
-        }).await;
-
-        //this returns Result<Result<T, OperationState>, RecvError>. If the
-        //outer Result returns an Err, then the sender was dropped before it
-        //sent any value, so we treat this as a cancelled state.
-        rx.await.map_err(|_| OperationState::Cancelled)?
+        F: FnOnce(&mut Context, Weak<Mutex<T>>) -> Operation<S> + Send + 'static
+    {
+        // If the OneshotSender returned by operation_to_future returns an
+        // error, then sender associated with the operation object was dropped
+        // before it sent any value, which we can treat as a cancelled state.
+        self.with_ctx(|ctx| {
+            async_polyfill::operation_to_future(
+                initial_value,
+                move |result| op(ctx, result)
+            )
+        }).await.await.map_err(|_| OperationState::Cancelled)?
     }
 
     /// Executes the given function `op`, and waits for the returned

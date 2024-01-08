@@ -58,6 +58,14 @@ pub trait Interceptor: Send + Sync {
         source: &OwnedSinkInputInfo
     ) -> Result<(), InterceptError>;
 
+    /// Updates the stream metadata for the given captured stream. This may
+    /// cork or uncork the stream depending on the cork state of all captured
+    /// applications.
+    async fn update_capture(
+        &mut self,
+        source: &OwnedSinkInputInfo
+    ) -> Result<(), Code>;
+
     /// Stops recording audio from the given application. If this interceptor
     /// is not currently recording audio from the given application, this
     /// returns `Ok(false)`.
@@ -309,6 +317,22 @@ impl Interceptor for SingleInputMonitor {
         Ok(())
     }
 
+    async fn update_capture(
+        &mut self,
+        source: &OwnedSinkInputInfo
+    ) -> Result<(), Code> {
+        if let Some(captured) = self.captured {
+            if captured.index == source.index && captured.corked != source.corked {
+                captured.corked = source.corked;
+                self.stream_manager.set_cork(captured.corked).await
+            } else {
+                Ok(())
+            }
+        } else {
+            Ok(())
+        }
+    }
+
     async fn stop(&mut self, source_idx: u32) -> Result<bool, Code> {
         if let Some(captured) = self.captured {
             if source_idx != captured.index {
@@ -385,6 +409,25 @@ impl Interceptor for CapturingInterceptor {
         info!("Intercepted application `{}'", source);
 
         Ok(())
+    }
+
+    async fn update_capture(
+        &mut self,
+        source: &OwnedSinkInputInfo
+    ) -> Result<(), Code> {
+        if let Some(capture) = self.captures.get_mut(&source.index) {
+            if capture.corked == source.corked {
+                return Ok(());
+            }
+
+            capture.corked = source.corked;
+        } else {
+            return Ok(());
+        }
+
+        self.stream_manager.set_cork(
+            self.captures.values().any(|capture| capture.corked)
+        ).await
     }
 
     async fn stop(&mut self, source_idx: u32) -> Result<bool, Code> {
@@ -479,6 +522,25 @@ impl Interceptor for DuplexingInterceptor {
         Ok(())
     }
 
+    async fn update_capture(
+        &mut self,
+        source: &OwnedSinkInputInfo
+    ) -> Result<(), Code> {
+        if let Some(capture) = self.captures.get_mut(&source.index) {
+            if capture.corked == source.corked {
+                return Ok(());
+            }
+
+            capture.corked = source.corked;
+        } else {
+            return Ok(());
+        }
+
+        self.stream_manager.set_cork(
+            self.captures.values().any(|capture| capture.corked)
+        ).await
+    }
+
     async fn stop(&mut self, source_idx: u32) -> Result<bool, Code> {
         if let Some(capture) = self.captures.get(&source_idx) {
             let target_sink = get_sink_or_default(
@@ -571,6 +633,17 @@ impl<I: LimitingInterceptor> Interceptor for QueuedInterceptor<I> {
                 InterceptError::PulseError(e)
             ),
         }
+    }
+
+    async fn update_capture(
+        &mut self,
+        source: &OwnedSinkInputInfo
+    ) -> Result<(), Code> {
+        self.queue.iter_mut()
+            .filter(|queued| queued.index == source.index)
+            .for_each(|queued| *queued = source.clone());
+
+        self.inner.update_capture(source).await
     }
 
     async fn stop(

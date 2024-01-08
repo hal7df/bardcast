@@ -11,7 +11,6 @@ use log::{debug, error, info, trace, warn};
 use ringbuf::HeapRb;
 use tokio::sync::oneshot::{
     self,
-    Receiver as OneshotReceiver,
     Sender as OneshotSender
 };
 use tokio::task::JoinHandle;
@@ -30,7 +29,8 @@ use libpulse::stream::{
 use crate::util::{Lease, Lessor};
 use super::super::owned::{OwnedSinkInfo, OwnedSinkInputInfo, OwnedSourceInfo};
 use super::{AsyncIntrospector, PulseContextWrapper};
-use super::async_polyfill::{InitializingFuture, StreamReadNotifier};
+use super::async_polyfill::{self, InitializingFuture, StreamReadNotifier};
+use super::collect::CollectResult;
 
 // MODULE-INTERNAL CONSTANTS ***************************************************
 
@@ -51,6 +51,8 @@ const SAMPLE_SPEC: SampleSpec = SampleSpec {
 
 const MAX_CONSECUTIVE_ERRORS: usize = 3;
 
+const COMMAND_QUEUE_SIZE: usize = 3;
+
 // TYPE DEFINITIONS ************************************************************
 pub trait StreamConfig {
     fn configure(&self, stream: Stream) -> Result<Stream, Code>;
@@ -66,19 +68,16 @@ pub trait IntoStreamConfig {
     ) -> Result<Self::Target, Code>;
 }
 
-pub struct StreamManager {
-    ctx: PulseContextWrapper,
-    sample_tx: Lessor<Producer<u8>>,
-    task: Option<(OneshotSender<()>, JoinHandle<()>)>,
-}
-
-pub struct ResolvedSinkInput(OwnedSinkInputInfo, OwnedSinkInfo);
-
 enum StreamWriteResult {
     DataWritten,
     PulseError(Code),
     HandleClosed,
     NoOp,
+}
+
+enum StreamCommand {
+    SetCork(bool, OneshotSender<Result<(), Code>>),
+    Shutdown,
 }
 
 type Consumer<T> = AsyncConsumer<T, Arc<AsyncRb<T, HeapRb<T>>>>;
@@ -87,6 +86,14 @@ type Producer<T> = AsyncProducer<T, Arc<AsyncRb<T, HeapRb<T>>>>;
 
 /// Type alias for the concrete audio consumer type.
 pub type SampleConsumer = Consumer<u8>;
+
+pub struct StreamManager {
+    ctx: PulseContextWrapper,
+    sample_tx: Lessor<Producer<u8>>,
+    task: Option<(Producer<StreamCommand>, JoinHandle<()>)>,
+}
+
+pub struct ResolvedSinkInput(OwnedSinkInputInfo, OwnedSinkInfo);
 
 // TYPE IMPLS ******************************************************************
 impl StreamManager {
@@ -106,6 +113,20 @@ impl StreamManager {
 
     pub fn is_closed(&self) -> bool {
         self.sample_tx.as_ref().is_some_and(|tx| tx.is_closed())
+    }
+
+    pub async fn set_cork(&mut self, cork: bool) -> Result<(), Code> {
+        if let Some((cmd_tx, _)) = self.task.as_mut() {
+            let (tx, rx) = oneshot::channel::<Result<(), Code>>();
+            
+            cmd_tx.push(StreamCommand::SetCork(
+                cork,
+                tx
+            )).await.map_err(|_| Code::Killed)?;
+            rx.await.map_err(|_| Code::Killed)?
+        } else {
+            Err(Code::NoEntity)
+        }
     }
 
     pub async fn monitor(&mut self) {
@@ -157,14 +178,17 @@ impl StreamManager {
                 ).await?;
             }
 
-            let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+            let (cmd_tx, cmd_rx) = 
+                AsyncRb::<StreamCommand, HeapRb<StreamCommand>>::new(
+                    COMMAND_QUEUE_SIZE
+                ).split();
             let task_handle = self.ctx.spawn(do_stream(
                 stream,
                 sample_tx,
-                shutdown_rx
+                cmd_rx
             )).await;
 
-            self.task = Some((shutdown_tx, task_handle));
+            self.task = Some((cmd_tx, task_handle));
             Ok(())
         } else {
             Err(Code::Exist)
@@ -172,10 +196,12 @@ impl StreamManager {
     }
 
     pub async fn stop(&mut self) {
-        if let Some((shutdown_tx, task_handle)) = self.task.take() {
-            if shutdown_tx.send(()).is_err() && !task_handle.is_finished() {
-                warn!("PulseAudio stream handler ignored shutdown signal. \
-                       Forcibly aborting task");
+        if let Some((mut cmd_tx, task_handle)) = self.task.take() {
+            if cmd_tx.push(StreamCommand::Shutdown).await.is_err() && !task_handle.is_finished() {
+                warn!(
+                    "PulseAudio stream handler ignored shutdown signal. \
+                     Forcibly aborting task"
+                );
                 task_handle.abort();
             }
 
@@ -304,11 +330,21 @@ impl Drop for StreamManager {
     fn drop(&mut self) {
         debug!("PulseAudio stream handler shutting down");
 
-        if let Some((shutdown_tx, _)) = self.task.take() {
+        if let Some((mut cmd_tx, task_handle)) = self.task.take() {
             warn!("PulseAudio stream manager shutting down while stream handler active");
-            if shutdown_tx.send(()).is_err() {
+
+            if !cmd_tx.is_closed() {
+                if cmd_tx.as_mut_base().push(StreamCommand::Shutdown).is_err() {
+                    warn!(
+                        "Command queue for PulseAudio stream handler is full. \
+                         Forcibly aborting task."
+                    );
+                    task_handle.abort();
+                }
+            } else {
                 info!(
-                    "PulseAudio stream handler task unexpectedly shut down before manager"
+                    "PulseAudio stream handler task unexpectedly shut down \
+                     before manager"
                 );
             }
         }
@@ -318,25 +354,6 @@ impl Drop for StreamManager {
 }
 
 // HELPER FUNCTIONS ************************************************************
-/// Determines if the stream handler should continue reading samples, or exit.
-///
-/// This also waits for data to appear in the underlying stream, to prevent
-/// needless iterating over a stream with no data.
-async fn should_continue_stream_read(
-    sample_tx: &AsyncProducer<u8, Arc<AsyncRb<u8, HeapRb<u8>>>>,
-    notify: &StreamReadNotifier,
-    shutdown_rx: &mut OneshotReceiver<()>
-) -> bool {
-    if sample_tx.is_closed() {
-        false
-    } else {
-        tokio::select! {
-            _ = notify.await_data() => true,
-            _ = shutdown_rx => false,
-        }
-    }
-}
-
 async fn stream_read(
     stream: &mut Stream,
     sample_tx: &mut Producer<u8>
@@ -389,28 +406,95 @@ async fn stream_read(
 async fn do_stream(
     mut stream: Stream,
     mut sample_tx: Lease<Producer<u8>>,
-    mut shutdown_rx: OneshotReceiver<()>
+    mut cmd_rx: Consumer<StreamCommand>
 ) {
     let notify = StreamReadNotifier::new(&mut stream);
     let mut err_count = 0usize;
 
-    while should_continue_stream_read(
-        &sample_tx,
-        &notify,
-        &mut shutdown_rx
-    ).await {
-        match stream_read(&mut stream, &mut sample_tx).await {
-            StreamWriteResult::HandleClosed => break,
-            StreamWriteResult::PulseError(e) => {
-                error!("Error reading from stream: {}", e);
-                err_count += 1;
+    while !sample_tx.is_closed() {
+        tokio::select! {
+            biased;
+            cmd = cmd_rx.pop() => match cmd {
+                Some(StreamCommand::SetCork(cork, tx)) => {
+                    let cork_state = stream.is_corked()
+                        .map_err(|e| Code::try_from(e).unwrap_or(Code::Unknown));
 
-                if err_count >= MAX_CONSECUTIVE_ERRORS {
+                    let ret_result = tx.send(match cork_state {
+                        Ok(cork_state) => if cork != cork_state {
+                            let op_result = if cork {
+                                async_polyfill::operation_to_future(
+                                    false,
+                                    |result| {
+                                        stream.cork(Some(Box::new(
+                                            move |success| result.store(success)
+                                        )))
+                                    }
+                                ).await
+                            } else {
+                                async_polyfill::operation_to_future(
+                                    false,
+                                    |result| {
+                                        stream.uncork(Some(Box::new(
+                                            move |success| result.store(success)
+                                        )))
+                                    }
+                                ).await
+                            };
+
+                            match op_result {
+                                Ok(Ok(res)) => if res {
+                                    Ok(())
+                                } else {
+                                    Err(Code::Unknown)
+                                },
+                                Ok(Err(_)) | Err(_) => Err(Code::Killed),
+                            }
+                        } else {
+                            Ok(())
+                        },
+                        Err(e) => Err(e),
+                    });
+
+                    if ret_result.is_err() {
+                        warn!(
+                            "Could not transmit cork operation result back to \
+                             stream manager"
+                        );
+                    }
+                },
+                Some(StreamCommand::Shutdown) | None => {
+                    info!("Received command to shut down PulseAudio stream");
                     break;
                 }
             },
-            StreamWriteResult::DataWritten | StreamWriteResult::NoOp => {
-                err_count = 0
+            _ = notify.await_data() => match stream_read(
+                &mut stream,
+                &mut sample_tx
+            ).await {
+                StreamWriteResult::HandleClosed => {
+                    info!(
+                        "PulseAudio stream receiver closed, shutting down \
+                         stream handler"
+                    );
+                    break;
+                },
+                StreamWriteResult::PulseError(e) => {
+                    error!("Error reading from stream: {}", e);
+                    err_count += 1;
+
+                    if err_count >= MAX_CONSECUTIVE_ERRORS {
+                        error!(
+                            "Stream handler encountered {} consecutive errors, \
+                             shutting down",
+                            e
+                        );
+
+                        break;
+                    }
+                },
+                StreamWriteResult::DataWritten | StreamWriteResult::NoOp => {
+                    err_count = 0;
+                }
             },
         }
     }
