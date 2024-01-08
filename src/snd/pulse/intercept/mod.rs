@@ -15,8 +15,20 @@ use std::fmt::{Display, Error as FormatError, Formatter};
 
 use async_trait::async_trait;
 use libpulse_binding::error::Code;
+use tokio::sync::watch::Receiver;
 
-use super::owned::OwnedSinkInputInfo;
+use crate::cfg::InterceptMode;
+use crate::util::task::ValueJoinHandle;
+use self::concrete::{
+    CapturingInterceptor,
+    DuplexingInterceptor,
+    SingleInputMonitor,
+    QueuedInterceptor
+};
+use super::context::{PulseContextWrapper, AsyncIntrospector};
+use super::context::stream::{IntoStreamConfig, SampleConsumer};
+use super::event::{AudioEntity, ChangeEvent, EventListener};
+use super::owned::{OwnedSinkInfo, OwnedSinkInputInfo};
 
 // CONSTANT DEFINITIONS ********************************************************
 const TEARDOWN_FAILURE_WARNING: &'static str =
@@ -158,6 +170,83 @@ impl Error for InterceptError<'_> {
 }
 
 // PUBLIC HELPER FUNCTIONS *****************************************************
+pub async fn start<L>(
+    ctx: &PulseContextWrapper,
+    sink: impl IntoStreamConfig<Target = OwnedSinkInfo>,
+    listen: L,
+    mode: InterceptMode,
+    volume: Option<f64>,
+    limit: Option<usize>,
+    shutdown_rx: Receiver<bool>
+) -> Result<ValueJoinHandle<SampleConsumer, ()>, Code>
+where
+    L: EventListener<
+        OwnedSinkInputInfo,
+        ChangeEvent<AudioEntity<OwnedSinkInputInfo>>
+    > + 'static
+{
+    match mode {
+        InterceptMode::Capture => {
+            let (intercept, stream) = CapturingInterceptor::new(
+                ctx,
+                volume,
+                limit
+            ).await?;
+
+            Ok(ValueJoinHandle::new(
+                stream,
+                if limit.is_some() {
+                    tokio::spawn(run(
+                        QueuedInterceptor::from(intercept),
+                        listen,
+                        shutdown_rx
+                    ))
+                } else {
+                    tokio::spawn(run(intercept, listen, shutdown_rx))
+                }
+            ))
+        },
+        InterceptMode::Monitor => {
+            if let Some(1) = limit {
+                let (intercept, stream) = SingleInputMonitor::new(
+                    ctx,
+                    volume
+                ).await;
+
+                Ok(ValueJoinHandle::new(
+                    stream,
+                    tokio::spawn(run(
+                        QueuedInterceptor::from(intercept),
+                        listen,
+                        shutdown_rx
+                    ))
+                ))
+            } else {
+                let (intercept, stream) = DuplexingInterceptor::from_sink(
+                    ctx,
+                    &sink.resolve(&AsyncIntrospector::from(ctx)).await?,
+                    volume,
+                    limit
+                ).await?;
+
+                Ok(ValueJoinHandle::new(
+                    stream,
+                    if limit.is_some() {
+                        tokio::spawn(run(
+                            QueuedInterceptor::from(intercept),
+                            listen,
+                            shutdown_rx
+                        ))
+                    } else {
+                        tokio::spawn(run(intercept, listen, shutdown_rx))
+                    }
+                ))
+            }
+        }
+    }
+}
+
+
 /// Helper function to close an interceptor if `res` is an error, returning the
 /// `Ok` value of `res` and the boxed interceptor if successful, otherwise
 /// bubbling up the error.
@@ -177,4 +266,18 @@ pub async fn boxed_close_interceptor_if_err<I: Interceptor + ?Sized, T, E>(
             Err(err)
         }
     }
+}
+
+// HELPER FUNCTIONS ************************************************************
+async fn run<L>(
+    intercept: impl Interceptor,
+    listen: L,
+    shutdown_rx: Receiver<bool>
+)
+where
+    L: EventListener<
+        OwnedSinkInputInfo,
+        ChangeEvent<AudioEntity<OwnedSinkInputInfo>>
+    >
+{
 }

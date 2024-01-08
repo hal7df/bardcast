@@ -93,6 +93,11 @@ pub struct StreamManager {
     task: Option<(Producer<StreamCommand>, JoinHandle<()>)>,
 }
 
+pub enum SinkId<'a> {
+    Index(u32),
+    Name(&'a str),
+}
+
 pub struct ResolvedSinkInput(OwnedSinkInputInfo, OwnedSinkInfo);
 
 // TYPE IMPLS ******************************************************************
@@ -216,6 +221,18 @@ impl StreamManager {
     }
 }
 
+impl<'a> SinkId<'a> {
+    pub fn merged(index: Option<u32>, name: Option<&'a str>) -> Option<Self> {
+        if let Some(index) = index {
+            Some(Self::Index(index))
+        } else if let Some(name) = name {
+            Some(Self::Name(name))
+        } else {
+            None
+        }
+    }
+}
+
 // TRAIT IMPLS *****************************************************************
 #[async_trait]
 impl<C: StreamConfig + Send + 'static> IntoStreamConfig for C {
@@ -267,6 +284,27 @@ impl IntoStreamConfig for u32 {
         introspect: &AsyncIntrospector
     ) -> Result<Self::Target, Code> {
         introspect.get_sink_by_index(self).await
+    }
+}
+
+#[async_trait]
+impl<'a> IntoStreamConfig for SinkId<'a> {
+    type Target = OwnedSinkInfo;
+
+    async fn resolve(
+        self,
+        introspect: &AsyncIntrospector
+    ) -> Result<Self::Target, Code> {
+        match self {
+            SinkId::Index(index) => IntoStreamConfig::resolve(
+                index,
+                introspect
+            ).await,
+            SinkId::Name(name) => IntoStreamConfig::resolve(
+                name,
+                introspect
+            ).await
+        }
     }
 }
 
