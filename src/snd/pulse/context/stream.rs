@@ -14,7 +14,7 @@ use tokio::sync::oneshot::{
     self,
     Sender as OneshotSender
 };
-use tokio::task::JoinHandle;
+use tokio::task::{self, JoinHandle};
 
 use libpulse::channelmap::Map as ChannelMap;
 use libpulse::context::Context;
@@ -578,12 +578,15 @@ async fn get_connected_stream(
 ) -> Result<Stream, Code> {
     let source = source.resolve(&AsyncIntrospector::from(ctx_wrap)).await?;
 
-    let stream_fut = ctx_wrap.with_ctx(move |ctx| create_and_connect_stream(
-        ctx,
-        source
-    )).await?;
+    let stream_fut = ctx_wrap.with_ctx(move |ctx| {
+        create_and_connect_stream(
+            ctx,
+            source
+        ).map(|fut| task::spawn_local(fut))
+    }).await?;
 
-    stream_fut.await_on(ctx_wrap).await
+    stream_fut.await
+        .map_err(|_| Code::Killed)?
         .map_err(|state| if state == State::Terminated {
             Code::Killed
         } else {

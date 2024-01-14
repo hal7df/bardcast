@@ -7,6 +7,7 @@ use std::future::Future;
 use std::marker::{PhantomData, Unpin};
 use std::mem;
 use std::pin::Pin;
+use std::rc::Rc;
 use std::sync::{Arc, Mutex, Weak};
 use std::task::{Context, Poll, Waker};
 
@@ -21,7 +22,6 @@ use libpulse::operation::{
 use libpulse::stream::{Stream as PulseStream, State as PulseStreamState};
 
 use crate::util;
-use super::PulseContextWrapper;
 
 //TYPE DEFINITIONS *************************************************************
 
@@ -57,7 +57,7 @@ pub trait InitializingEntity<S> {
 /// [`Result`].
 pub struct InitializingFuture<S, T: InitializingEntity<S>>(
     Option<T>,
-    PhantomData<S>
+    PhantomData<Rc<S>>, //satisfies the S generic, impls !Send + !Sync
 );
 
 /// Helper for asynchronously determining when a recording audio stream has new
@@ -118,30 +118,6 @@ impl<S, T: InitializingEntity<S>> Drop for InitializingFuture<S, T> {
             //nonexistent task
             entity.wake_on_state_change(None)
         }
-    }
-}
-
-impl<S, T> InitializingFuture<S, T>
-where
-    S: Unpin + Send + 'static,
-    T: InitializingEntity<S> + Unpin + Send + 'static
-{
-    /// Awaits this future on the same thread as the context handler.
-    ///
-    /// `InitializingFuture` is generally not safe to await on a separate thread
-    /// from the [`PulseContext`] that spawned the entity it holds. (This is
-    /// difficult to model with the [`Send`] trait, as it is sometimes useful to
-    /// move an `InitializingFuture` between threads, but not await it). In the
-    /// event that the owner of the future cannot spawn a local task on the
-    /// context thread, this helper function spawns a task on the contex thread
-    /// using a reference to the [`PulseContextWrapper`], and returns the
-    /// result.
-    pub async fn await_on(
-        self,
-        ctx_wrap: &PulseContextWrapper
-    ) -> Result<T, S> {
-        ctx_wrap.spawn(async move { self.await }).await.await
-            .expect("Entity initialization task unexpectedly failed")
     }
 }
 
