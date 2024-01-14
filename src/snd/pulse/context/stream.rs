@@ -2,6 +2,7 @@
 
 extern crate libpulse_binding as libpulse;
 
+use std::fmt::{Display, Error as FormatError, Formatter};
 use std::panic;
 use std::sync::Arc;
 
@@ -361,6 +362,15 @@ impl StreamConfig for ResolvedSinkInput {
             .map_err(|pa_err| Code::try_from(pa_err).unwrap_or(Code::Unknown))?;
 
         self.1.configure(stream)
+    }
+}
+
+impl Display for SinkId<'_> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), FormatError> {
+        match self {
+            Self::Index(idx) => write!(f, "sink index {}", idx),
+            Self::Name(name) => name.fmt(f),
+        }
     }
 }
 

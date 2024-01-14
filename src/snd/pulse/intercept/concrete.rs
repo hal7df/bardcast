@@ -216,10 +216,6 @@ impl Interceptor for SingleInputMonitor {
     async fn close(mut self) {
         self.stream_manager.stop().await;
     }
-
-    async fn boxed_close(mut self: Box<Self>) {
-        self.close().await;
-    }
 }
 
 impl LimitingInterceptor for SingleInputMonitor {
@@ -329,10 +325,6 @@ impl Interceptor for CapturingInterceptor {
             self.captures.keys().copied().collect::<Vec<u32>>()
         ).await;
         util::tear_down_virtual_sink(&self.introspect, &self.rec, None).await;
-    }
-
-    async fn boxed_close(mut self: Box<Self>) {
-        self.close().await;
     }
 }
 
@@ -455,10 +447,6 @@ impl Interceptor for DuplexingInterceptor {
             Some(&self.orig)
         ).await;
     }
-
-    async fn boxed_close(mut self: Box<Self>) {
-        self.close().await;
-    }
 }
 
 impl LimitingInterceptor for DuplexingInterceptor {
@@ -555,10 +543,6 @@ impl<I: LimitingInterceptor> Interceptor for QueuedInterceptor<I> {
 
     async fn close(mut self) {
         self.inner.close().await
-    }
-
-    async fn boxed_close(mut self: Box<Self>) {
-        self.close().await;
     }
 }
 

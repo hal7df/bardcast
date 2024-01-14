@@ -15,7 +15,8 @@ use std::fmt::{Display, Error as FormatError, Formatter};
 
 use async_trait::async_trait;
 use libpulse_binding::error::Code;
-use tokio::sync::watch::Receiver;
+use log::{debug, error, info, warn};
+use tokio::sync::broadcast::error::RecvError;
 
 use crate::cfg::InterceptMode;
 use crate::util::task::ValueJoinHandle;
@@ -27,7 +28,12 @@ use self::concrete::{
 };
 use super::context::{PulseContextWrapper, AsyncIntrospector};
 use super::context::stream::{IntoStreamConfig, SampleConsumer};
-use super::event::{AudioEntity, ChangeEvent, EventListener};
+use super::event::{
+    AudioEntity,
+    ChangeEvent,
+    EventListener,
+    EventListenerError
+};
 use super::owned::{OwnedSinkInfo, OwnedSinkInputInfo};
 
 // CONSTANT DEFINITIONS ********************************************************
@@ -40,7 +46,7 @@ const SINK_INPUT_MOVE_FAILURE: &'static str =
 // TYPE DEFINITIONS ************************************************************
 /// Represents possible error modes for [`Interceptor::record()`].
 #[derive(Debug)]
-pub enum InterceptError<'a> {
+enum InterceptError<'a> {
     /// PulseAudio returned an error while attempting to intercept the
     /// application.
     PulseError(Code),
@@ -56,7 +62,7 @@ pub enum InterceptError<'a> {
 /// read their stream. This interface also provides a few functions to query the
 /// current state of intercepted streams.
 #[async_trait]
-pub trait Interceptor: Send + Sync {
+trait Interceptor: Send + Sync {
     /// Starts recording audio from the given application.
     async fn record<'a>(
         &mut self,
@@ -95,14 +101,11 @@ pub trait Interceptor: Send + Sync {
     /// `Interceptor`, returning any intercepted streams to another audio device
     /// if needed.
     async fn close(mut self);
-
-    /// Version of [`Interceptor::close`] for boxed trait objects.
-    async fn boxed_close(mut self: Box<Self>);
 }
 
 /// Specialization of [`Interceptor`] that allows for limits on the number of
 /// concurrently captured applications.
-pub trait LimitingInterceptor: Interceptor {
+trait LimitingInterceptor: Interceptor {
     /// Returns the number of concurrent applications that can be intercepted
     /// by this `LimitedInterceptor` instance.
     ///
@@ -177,7 +180,6 @@ pub async fn start<L>(
     mode: InterceptMode,
     volume: Option<f64>,
     limit: Option<usize>,
-    shutdown_rx: Receiver<bool>
 ) -> Result<ValueJoinHandle<SampleConsumer, ()>, Code>
 where
     L: EventListener<
@@ -199,10 +201,9 @@ where
                     tokio::spawn(run(
                         QueuedInterceptor::from(intercept),
                         listen,
-                        shutdown_rx
                     ))
                 } else {
-                    tokio::spawn(run(intercept, listen, shutdown_rx))
+                    tokio::spawn(run(intercept, listen))
                 }
             ))
         },
@@ -217,8 +218,7 @@ where
                     stream,
                     tokio::spawn(run(
                         QueuedInterceptor::from(intercept),
-                        listen,
-                        shutdown_rx
+                        listen
                     ))
                 ))
             } else {
@@ -234,11 +234,10 @@ where
                     if limit.is_some() {
                         tokio::spawn(run(
                             QueuedInterceptor::from(intercept),
-                            listen,
-                            shutdown_rx
+                            listen
                         ))
                     } else {
-                        tokio::spawn(run(intercept, listen, shutdown_rx))
+                        tokio::spawn(run(intercept, listen))
                     }
                 ))
             }
@@ -246,33 +245,10 @@ where
     }
 }
 
-
-/// Helper function to close an interceptor if `res` is an error, returning the
-/// `Ok` value of `res` and the boxed interceptor if successful, otherwise
-/// bubbling up the error.
-///
-/// Due to the lack of an async `Drop` trait, closing interceptors must be done
-/// manually, which can make code that deals with `Result` types less ergonomic.
-/// This function alleviates this problem by allowing for the continued use of
-/// the `?` operator without causing resource leaks in the PulseAudio server.
-pub async fn boxed_close_interceptor_if_err<I: Interceptor + ?Sized, T, E>(
-    intercept: Box<I>,
-    res: Result<T, E>
-) -> Result<(T, Box<I>), E> {
-    match res {
-        Ok(val) => Ok((val, intercept)),
-        Err(err) => {
-            intercept.boxed_close().await;
-            Err(err)
-        }
-    }
-}
-
 // HELPER FUNCTIONS ************************************************************
 async fn run<L>(
-    intercept: impl Interceptor,
-    listen: L,
-    shutdown_rx: Receiver<bool>
+    mut intercept: impl Interceptor,
+    mut listen: L
 )
 where
     L: EventListener<
@@ -280,4 +256,92 @@ where
         ChangeEvent<AudioEntity<OwnedSinkInputInfo>>
     >
 {
+    debug!("Application stream intercept task started");
+
+    loop {
+        tokio::select! {
+            change_event = listen.next_ignore_lag() => match change_event {
+                Ok(ChangeEvent::New(AudioEntity::Info(input))) => {
+                    let input_idx = input.index;
+
+                    match intercept.record(Cow::Owned(input)).await {
+                        Ok(()) => {},
+                        Err(InterceptError::PulseError(e)) => error!(
+                            "Failed to intercept application with index {} \
+                             (error: {})",
+                            input_idx,
+                            e
+                        ),
+                        Err(InterceptError::AtCapacity(n, _)) => error!(
+                            "Failed to intercept application with index {} as \
+                             the interceptor was unexpectedly at capacity \
+                             ({}). This should not happen; please submit a bug \
+                             report with your run configuration.",
+                            input_idx,
+                            n
+                        ),
+                    }
+                },
+                Ok(ChangeEvent::Changed(AudioEntity::Info(input))) => {
+                    if let Err(e) = intercept.update_capture(&input).await {
+                        warn!(
+                            "Failed to read status update for application with \
+                             index {} (error: {}). This may prevent audio from \
+                             being recorded.",
+                            input.index,
+                            e
+                        );
+                    }
+                },
+                Ok(ChangeEvent::Removed(entity)) => {
+                    let idx = match entity {
+                        AudioEntity::Info(info) => info.index,
+                        AudioEntity::Index(index) => index,
+                    };
+
+                    match intercept.stop(idx).await {
+                        Ok(true) => info!(
+                            "Stopped intercept on application with index {}",
+                            idx
+                        ),
+                        Ok(false) => debug!(
+                            "Did not stop intercept on application with index \
+                             {} as it was not intercepted",
+                            idx
+                        ),
+                        Err(e) => error!(
+                            "Failed to stop intercept on application with \
+                             index {} (error: {}). {}",
+                            idx,
+                            e,
+                            TEARDOWN_FAILURE_WARNING
+                        ),
+                    }
+                },
+                Ok(ChangeEvent::New(AudioEntity::Index(input_idx))) |
+                Ok(ChangeEvent::Changed(AudioEntity::Index(input_idx))) => info!(
+                    "Ignoring new/change event for unresolved sink input  with \
+                     index {}",
+                    input_idx
+                ),
+                Err(EventListenerError::LookupError(e)) => warn!(
+                    "Interceptor could not update intercepts as the entity \
+                     lookup for a change event failed (error: {}).",
+                    e
+                ),
+                Err(EventListenerError::ChannelError(RecvError::Closed)) => {
+                    // This is the shutdown signal
+                    break;
+                },
+                Err(EventListenerError::ChannelError(RecvError::Lagged(_))) => debug!(
+                    "Intercept unexpectedly received unhandled channel lag \
+                     notification"
+                ),
+            },
+            _ = intercept.monitor(), if intercept.needs_monitor() => {},
+        }
+    }
+
+    intercept.close().await;
+    debug!("Application stream intercept shut down");
 }
