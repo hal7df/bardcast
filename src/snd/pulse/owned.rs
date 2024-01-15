@@ -15,7 +15,7 @@ use libpulse::sample::Spec;
 use libpulse::time::MicroSeconds;
 use libpulse::volume::{ChannelVolumes, Volume};
 
-const UNKNOWN_ENTITY_LABEL: String = String::from("[unknown]");
+const UNKNOWN_ENTITY_LABEL: &'static str = "[unknown]";
 
 // TYPE DEFINITIONS ************************************************************
 
@@ -234,5 +234,10 @@ fn fmt_name_or_index(
     name: Option<&String>,
     index: u32
 ) -> Result<(), FormatError> {
-    write!(f, "{} (index {})", name.unwrap_or(&UNKNOWN_ENTITY_LABEL), index)
+    write!(
+        f,
+        "{} (index {})",
+        name.unwrap_or(&String::from(UNKNOWN_ENTITY_LABEL)),
+        index
+    )
 }

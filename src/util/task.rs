@@ -72,29 +72,6 @@ impl<T> AbortingJoinHandle<T> {
 }
 
 impl<T> ControlledJoinHandle<T> {
-    /// Aborts the underlying task without sending a stop signal. Identical to
-    /// [`JoinHandle::abort`].
-    pub fn abort(&self) {
-        if let Self::ActiveTask(task, _) = self {
-            task.abort();
-        }
-    }
-
-    /// Checks if the task associated with this `ControlledJoinHandle` has
-    /// finished.
-    ///
-    /// As with [`JoinHandle::is_finished`], this method can return `false` even
-    /// if [`ControlledJoinHandle::abort`] has been called on the task, as this
-    /// does not return true until the task has actually stopped, which does not
-    /// happen immediately when a task is aborted.
-    pub fn is_finished(&self) -> bool {
-        if let Self::ActiveTask(task, _) = self {
-            task.is_finished()
-        } else {
-            true
-        }
-    }
-
     /// Waits for the underlying task to return a result, without aborting or
     /// signaling to the task to quit.
     pub async fn await_completion(&mut self) {
@@ -167,11 +144,11 @@ impl<T> TaskSetBuilder<T> {
 }
 
 impl<T> TaskSet<T> {
-    pub fn merge(self, other: Self) -> Self {
-        if let Some(task_fut) = self.0 {
+    pub fn merge(mut self, mut other: Self) -> Self {
+        if let Some(task_fut) = self.0.take() {
             let mut tasks = task_fut.into_inner();
 
-            if let Some(other_task_fut) = other.0 {
+            if let Some(other_task_fut) = other.0.take() {
                 let mut other_tasks = other_task_fut.into_inner();
                 tasks.append(&mut other_tasks)
             }
@@ -194,7 +171,7 @@ where F: FnOnce(OneshotReceiver<()>) -> JoinHandle<T> {
 }
 
 #[async_trait]
-impl<T> TaskContainer<T> for TaskSet<T> {
+impl<T: Send> TaskContainer<T> for TaskSet<T> {
     async fn join_next(&mut self) -> Option<Result<T, JoinError>> {
         if let Some(next_task) = &mut self.0 {
             let (result, _, tasks) = next_task.await;

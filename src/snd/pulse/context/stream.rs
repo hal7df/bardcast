@@ -317,9 +317,11 @@ impl IntoStreamConfig for OwnedSinkInputInfo {
         self,
         introspect: &AsyncIntrospector
     ) -> Result<Self::Target, Code> {
+        let sink_idx = self.sink;
+
         Ok(ResolvedSinkInput(
             self,
-            introspect.get_sink_by_index(self.sink).await?
+            introspect.get_sink_by_index(sink_idx).await?
         ))
     }
 }
@@ -610,7 +612,7 @@ fn create_and_connect_stream(
         .map_err(|_| Code::Invalid)?;
     channel_map.init_stereo();
 
-    let mut stream = Stream::new(
+    let stream = Stream::new(
         ctx,
         "capture stream",
         &SAMPLE_SPEC,

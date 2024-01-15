@@ -139,7 +139,7 @@ impl From<Code> for InterceptError<'_> {
 impl<'a> TryFrom<InterceptError<'a>> for Code {
     type Error = InterceptError<'a>;
 
-    fn try_from(err: InterceptError) -> Result<Self, Self::Error> {
+    fn try_from(err: InterceptError<'a>) -> Result<Self, Self::Error> {
         if let InterceptError::PulseError(code) = err {
             Ok(code)
         } else {
@@ -162,15 +162,10 @@ impl Display for InterceptError<'_> {
     }
 }
 
-impl Error for InterceptError<'_> {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        if let Self::PulseError(code) = self {
-            Some(&code)
-        } else {
-            None
-        }
-    }
-}
+/// Due to lifetime constraints, `InterceptError` cannot correctly implement
+/// [`Error::source()`]. To get a [`Code`] from an `InterceptError`, use
+/// [`Code::try_from`].
+impl Error for InterceptError<'_> {}
 
 // PUBLIC HELPER FUNCTIONS *****************************************************
 pub async fn start<L>(

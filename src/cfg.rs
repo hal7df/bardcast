@@ -426,7 +426,7 @@ fn validate_log_level(raw_level: &Option<String>) -> Result<Option<LevelFilter>,
 }
 
 fn validate_stream_timeout(raw_timeout: &Result<Option<u64>, String>) -> Result<Option<Duration>, String> {
-    raw_timeout.map(|timeout| timeout.map(
+    raw_timeout.as_ref().map(|timeout| timeout.map(
             |timeout_ms| Duration::from_millis(timeout_ms)
     )).map_err(|s| format!("stream-timeout-ms: Not a valid timeout: {}", s))
 }

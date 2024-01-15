@@ -211,7 +211,7 @@ impl ConnectedClient {
         }
 
         //Tear down the connection
-        self.cleanup(playback);
+        self.cleanup(playback).await;
 
         //If the shutdown condition is an error, then panic the thread to cause
         //the rest of the application to shut down
@@ -233,7 +233,7 @@ impl ConnectedClient {
         }
 
         //Post a message that the application is disconnecting
-        self.channels.goodbye(self.cache_http.http());
+        self.channels.goodbye(self.cache_http.http()).await;
 
         //Shut down the client handler thread, if it is still running
         if let Some(client_tx) = mem::take(&mut self.client_tx) {

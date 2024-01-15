@@ -39,16 +39,11 @@ pub struct Lessor<T>(LessorState<T>);
 /// A raw owned value cannot be taken from a `Lease`.
 pub struct Lease<T> {
     value: ManuallyDrop<T>,
-    tx: OneshotSender<T>,
+    tx: ManuallyDrop<OneshotSender<T>>,
 }
 
 // TYPE IMPLS ******************************************************************
 impl<T> LessorState<T> {
-    /// Returns true if the value controlled by the lessor is currently leased.
-    fn is_leased(&self) -> bool {
-        !matches!(self, Self::Owned(_))
-    }
-
     /// Attempts to take ownership of the controlled value, if present. If not
     /// present, returns the current state.
     fn take(self) -> Result<T, Self> {
@@ -87,12 +82,6 @@ impl<T> Lessor<T> {
         Self(LessorState::Owned(value))
     }
 
-    /// Returns true if the value controlled by the `Lessor` is currently
-    /// leased.
-    pub fn is_leased(&self) -> bool {
-        !self.0.is_leased()
-    }
-
     /// Takes an immutable reference to the controlled value, if currently
     /// owned by the `Lessor`.
     pub fn as_ref(&self) -> Option<&T> {
@@ -101,23 +90,6 @@ impl<T> Lessor<T> {
         } else {
             None
         }
-    }
-
-    /// Takes a mutable reference to the controlled value, if currently owned
-    /// by the `Lessor`.
-    pub fn as_mut(&mut self) -> Option<&mut T> {
-        if let LessorState::Owned(value) = &mut self.0 {
-            Some(value)
-        } else {
-            None
-        }
-    }
-
-    /// Consumes this `Lessor`, returning the raw owned value if it is currently
-    /// owned. If the value is currently leased, this will return `None` and
-    /// the value will be dropped when the current lease is dropped.
-    pub fn take(self) -> Option<T> {
-        self.0.take().ok()
     }
 
     /// Creates a [`Lease`] object providing exclusive access to the controlled
@@ -133,7 +105,7 @@ impl<T> Lessor<T> {
             Ok(value) => {
                 Some(Lease {
                     value: ManuallyDrop::new(value),
-                    tx,
+                    tx: ManuallyDrop::new(tx),
                 })
             },
             Err(state) => {
@@ -169,9 +141,14 @@ impl<T> DerefMut for Lease<T> {
 
 impl<T> Drop for Lease<T> {
     fn drop(&mut self) {
-        let value = unsafe { ManuallyDrop::take(&mut self.value) };
+        let (value, tx) = unsafe { 
+            (
+                ManuallyDrop::take(&mut self.value),
+                ManuallyDrop::take(&mut self.tx)
+            )
+        };
 
-        if self.tx.send(value).is_err() {
+        if tx.send(value).is_err() {
             debug!("Lessor went out of scope while value lease was active");
         }
     }

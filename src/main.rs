@@ -19,7 +19,7 @@ use tokio::task::{JoinError, LocalSet};
 use self::cfg::{Action, Args, ApplicationConfig, SelectedConsumer};
 use self::consumer::discord::{self, DiscordConsumer};
 use self::util::fmt as fmt_util;
-use self::util::task::TaskSet;
+use self::util::task::{TaskContainer, TaskSet};
 
 #[cfg(feature = "wav")]
 use self::consumer::wav::WavConsumer;

@@ -67,7 +67,12 @@ pub async fn select_and_start_driver(
     info!("Configured sound drivers: {}", DRIVERS.join(", "));
 
     if let Some(driver_name) = &config.driver_name {
-        start_driver(driver_name.as_str(), config, consumer, &shutdown_rx).await
+        start_driver(
+            driver_name.as_str(),
+            config,
+            consumer,
+            &shutdown_rx
+        ).await.map_err(|(e, _)| e)
     } else {
         autodetect_driver(config, consumer, &shutdown_rx).await
     }
@@ -88,30 +93,41 @@ async fn start_consumer<S: AudioStream + Send + Sync + 'static>(
     tasks: TaskSet<()>,
     shutdown_rx: &Receiver<bool>
 ) -> Result<TaskSet<()>, StartError> {
-    tasks.merge(consumer.start(
+    Ok(tasks.merge(consumer.start(
         stream,
         shutdown_rx.clone()
-    ).await.map_err(|e| StartError::ConsumerInitializationError(e))?)
+    ).await.map_err(|e| StartError::ConsumerInitializationError(e))?))
 }
 
 /// Attempts to start the driver with the given name.
-async fn start_driver(
+async fn start_driver<C: AudioConsumer>(
     driver_name: &str,
     config: &ApplicationConfig,
-    consumer: impl AudioConsumer,
+    consumer: C,
     shutdown_rx: &Receiver<bool>
-) -> Result<TaskSet<()>, StartError> {
-    let start_result: Result<TaskSet<()>, StartError> = match driver_name {
+) -> Result<TaskSet<()>, (StartError, Option<C>)> {
+    let start_result: Result<TaskSet<()>, (StartError, Option<C>)> = match driver_name {
         #[cfg(all(target_family = "unix", feature = "pulse"))]
         pulse::DRIVER_NAME => {
-            let (stream, tasks) = pulse::start_driver(
+            let start_res = pulse::start_driver(
                 &config.pulse,
                 shutdown_rx.clone()
-            ).await.map_err(|e| e.into());
+            ).await;
 
-            start_consumer(consumer, stream, tasks, shutdown_rx).await
+            match start_res {
+                Ok((stream, tasks)) => start_consumer(
+                    consumer,
+                    stream,
+                    tasks,
+                    shutdown_rx
+                ).await.map_err(|e| (e, None)),
+                Err(e) => Err((StartError::from(e), Some(consumer))),
+            }
         },
-        _ => Err(StartError::UnknownDriver(driver_name.to_string())),
+        _ => Err((
+            StartError::UnknownDriver(driver_name.to_string()),
+            Some(consumer)
+        )),
     };
 
     if start_result.is_ok() {
@@ -129,18 +145,30 @@ async fn start_driver(
 /// the call stack.
 async fn autodetect_driver(
     config: &ApplicationConfig,
-    consumer: impl AudioConsumer,
+    mut consumer: impl AudioConsumer,
     shutdown_rx: &Receiver<bool>
 ) -> Result<TaskSet<()>, StartError> {
     for driver_name in DRIVERS.iter() {
         match start_driver(driver_name, config, consumer, shutdown_rx).await {
             Ok(driver) => return Ok(driver),
-            Err(StartError::ConnectionError(msg)) => debug!(
-                "Driver '{}' failed to connect: {}",
-                driver_name,
-                msg
-            ),
-            Err(e) => return Err(e),
+            Err((e, cons)) => {
+
+                if let StartError::ConnectionError(msg) = &e {
+                    debug!(
+                        "Driver '{}' failed to connect: {}",
+                        driver_name,
+                        msg
+                    );
+                } else {
+                    return Err(e);
+                }
+                
+                if let Some(cons) = cons {
+                    consumer = cons;
+                } else {
+                    return Err(e);
+                }
+            }
         }
     }
 

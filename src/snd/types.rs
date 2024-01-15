@@ -127,7 +127,7 @@ where <R as RbRef>::Rb: AsyncRbRead<u8> {
     }
 }
 
-impl<R: RbRef + Sync + 'static> AudioStream for AsyncConsumer<u8, R>
+impl<R: RbRef + Send + Sync + 'static> AudioStream for AsyncConsumer<u8, R>
 where <R as RbRef>::Rb: AsyncRbRead<u8> {
     type AsyncImpl = Self;
     type SyncImpl = SyncStreamAdapter<Self>;
@@ -145,9 +145,9 @@ where <R as RbRef>::Rb: AsyncRbRead<u8> {
 }
 
 #[async_trait]
-impl<A: StreamNotifier + Sync> StreamNotifier for SyncStreamAdapter<A> {
+impl<A: StreamNotifier + Sync + Send> StreamNotifier for SyncStreamAdapter<A> {
     async fn await_samples(&self) {
-        self.reader.await_samples();
+        self.reader.await_samples().await;
     }
 }
 
@@ -172,7 +172,7 @@ impl<A: AsyncRead + Unpin> Read for SyncStreamAdapter<A> {
             )
         }
 
-        self.runtime.expect(
+        self.runtime.as_ref().expect(
             "SyncStreamAdapter should have an initialized Runtime"
         ).block_on(async {
             let timeout = tokio::time::sleep(self.async_timeout);

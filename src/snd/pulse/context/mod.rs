@@ -32,7 +32,6 @@ use libpulse::context::{Context, FlagSet, State as ContextState};
 use libpulse::error::Code;
 use libpulse::mainloop::standard::{IterateResult, Mainloop};
 use libpulse::operation::{Operation, State as OperationState};
-use libpulse::sample::{Format as SampleFormat, Spec as SampleSpec};
 
 use self::async_polyfill::InitializingFuture;
 use crate::util::task::{ControlledJoinHandle, ValueJoinHandle};
@@ -44,21 +43,6 @@ pub use self::introspect::AsyncIntrospector;
 
 /// The maximum number of context operations that can be queued at once.
 const OP_QUEUE_SIZE: usize = 32;
-
-/// The audio sample rate in Hz. Per the driver specification, this must be
-/// 48 kHz.
-const SAMPLE_RATE: u32 = 48000;
-
-/// The size of the sample buffer in bytes.
-const SAMPLE_QUEUE_SIZE: usize = SAMPLE_RATE as usize * 2;
-
-/// PulseAudio [`SampleSpec`] definition matching the requirements of the driver
-/// specification.
-const SAMPLE_SPEC: SampleSpec = SampleSpec {
-    format: SampleFormat::F32le,
-    channels: 2,
-    rate: SAMPLE_RATE,
-};
 
 /// The default maximum interval between mainloop iterations.
 const DEFAULT_MAINLOOP_MAX_INTERVAL: Duration = Duration::from_millis(20);
@@ -144,7 +128,7 @@ impl PulseContextWrapper {
             if tx.send(op(ctx)).is_err() {
                 panic!("Context task result receiver unexpectedly dropped");
             }
-        });
+        }).await;
 
         rx.await.expect("Context task unexpectedly dropped without returning")
     }
@@ -432,13 +416,13 @@ async fn start_context_handler(
 
                 debug!("Context handler shutting down");
                 ctx.disconnect();
-                stop_mainloop(mainloop_handle);
+                stop_mainloop(mainloop_handle).await;
                 debug!("Context handler shut down");
             }))
         },
         Err(state) => {
             error!("PulseAudio context failed to connect");
-            stop_mainloop(mainloop_handle);
+            stop_mainloop(mainloop_handle).await;
             Err(if state == ContextState::Terminated {
                 Code::ConnectionTerminated
             } else {

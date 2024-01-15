@@ -160,10 +160,11 @@ impl Interceptor for SingleInputMonitor {
         );
         self.stream_manager.stop().await;
         self.stream_manager.start(source.clone(), self.volume).await?;
+        
+        info!("Started monitor of application `{}'", source);
 
         self.captured = Some(source);
 
-        info!("Started monitor of application `{}'", source);
 
         Ok(())
     }
@@ -172,7 +173,7 @@ impl Interceptor for SingleInputMonitor {
         &mut self,
         source: &OwnedSinkInputInfo
     ) -> Result<(), Code> {
-        if let Some(captured) = self.captured {
+        if let Some(captured) = self.captured.as_mut() {
             if captured.index == source.index && captured.corked != source.corked {
                 captured.corked = source.corked;
                 self.stream_manager.set_cork(captured.corked).await
@@ -185,7 +186,7 @@ impl Interceptor for SingleInputMonitor {
     }
 
     async fn stop(&mut self, source_idx: u32) -> Result<bool, Code> {
-        if let Some(captured) = self.captured {
+        if let Some(captured) = self.captured.as_ref() {
             if source_idx != captured.index {
                 return Ok(false);
             }
@@ -298,7 +299,7 @@ impl Interceptor for CapturingInterceptor {
 
             if self.captures.is_empty() {
                 debug!("Stopping PulseAudio stream");
-                self.stream_manager.stop();
+                self.stream_manager.stop().await;
             }
 
             Ok(true)
@@ -320,10 +321,13 @@ impl Interceptor for CapturingInterceptor {
     }
 
     async fn close(mut self) {
+        let capture_idxs = self.captures.keys().copied().collect::<Vec<u32>>();
+
         interceptor_stop_all(
             &mut self,
-            self.captures.keys().copied().collect::<Vec<u32>>()
+            capture_idxs
         ).await;
+
         util::tear_down_virtual_sink(&self.introspect, &self.rec, None).await;
     }
 }
@@ -430,9 +434,11 @@ impl Interceptor for DuplexingInterceptor {
     }
 
     async fn close(mut self) {
+        let capture_idxs = self.captures.keys().copied().collect::<Vec<u32>>();
+
         interceptor_stop_all(
             &mut self,
-            self.captures.keys().copied().collect::<Vec<u32>>()
+            capture_idxs
         ).await;
 
         //Tear down demux and rec sinks

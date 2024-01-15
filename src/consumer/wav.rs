@@ -46,7 +46,7 @@ struct WavWriteState<I> {
 }
 
 // TYPE IMPLS ******************************************************************
-impl<'a, P: AsRef<Path>> WavConsumer<'a, P> {
+impl<'a, P: AsRef<Path> + Sync> WavConsumer<'a, P> {
     /// Creates a new `WavConsumer` that writes to the path provided by
     /// `output_file`.
     pub fn new(output_file: &'a P, read_timeout: Option<Duration>) -> Self {
@@ -59,7 +59,7 @@ impl<'a, P: AsRef<Path>> WavConsumer<'a, P> {
 
 // TRAIT IMPLS *****************************************************************
 #[async_trait]
-impl<'a, P: AsRef<Path>> AudioConsumer for WavConsumer<'a, P> {
+impl<'a, P: AsRef<Path> + Sync> AudioConsumer for WavConsumer<'a, P> {
     async fn start<S: AudioStream + Send + Sync>(
         self,
         stream: S,
@@ -70,7 +70,7 @@ impl<'a, P: AsRef<Path>> AudioConsumer for WavConsumer<'a, P> {
         );
         let writer = task::spawn_blocking(move || {
             wave_stream::write_wav(output, WavHeader {
-                sample_format: SampleFormat::FLoat,
+                sample_format: SampleFormat::Float,
                 channels: Channels::new().front_left().front_right(),
                 sample_rate: SAMPLE_RATE
             })?.get_random_access_f32_writer()
