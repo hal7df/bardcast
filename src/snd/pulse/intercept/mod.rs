@@ -97,6 +97,9 @@ trait Interceptor: Send + Sync {
     /// interceptor.
     fn len(&self) -> usize;
 
+    /// Determines whether the consuming end of the stream has closed.
+    fn stream_closed(&self) -> bool;
+
     /// Gracefully closes any system resources that were created by the
     /// `Interceptor`, returning any intercepted streams to another audio device
     /// if needed.
@@ -253,7 +256,7 @@ where
 {
     debug!("Application stream intercept task started");
 
-    loop {
+    while !intercept.stream_closed() {
         tokio::select! {
             change_event = listen.next_ignore_lag() => match change_event {
                 Ok(ChangeEvent::New(AudioEntity::Info(input))) => {
@@ -325,7 +328,8 @@ where
                     e
                 ),
                 Err(EventListenerError::ChannelError(RecvError::Closed)) => {
-                    // This is the shutdown signal
+                    // If the event listener shuts down, that is an indication
+                    // this task must shut down too
                     break;
                 },
                 Err(EventListenerError::ChannelError(RecvError::Lagged(_))) => debug!(

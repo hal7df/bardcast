@@ -214,6 +214,10 @@ impl Interceptor for SingleInputMonitor {
         if self.captured.is_some() { 1usize } else { 0usize }
     }
 
+    fn stream_closed(&self) -> bool {
+        self.stream_manager.is_closed()
+    }
+
     async fn close(mut self) {
         self.stream_manager.stop().await;
     }
@@ -318,6 +322,10 @@ impl Interceptor for CapturingInterceptor {
 
     fn len(&self) -> usize {
         self.captures.len()
+    }
+
+    fn stream_closed(&self) -> bool {
+        self.stream_manager.is_closed()
     }
 
     async fn close(mut self) {
@@ -433,6 +441,10 @@ impl Interceptor for DuplexingInterceptor {
         self.captures.len()
     }
 
+    fn stream_closed(&self) -> bool {
+        self.stream_manager.is_closed()
+    }
+
     async fn close(mut self) {
         let capture_idxs = self.captures.keys().copied().collect::<Vec<u32>>();
 
@@ -545,6 +557,10 @@ impl<I: LimitingInterceptor> Interceptor for QueuedInterceptor<I> {
 
     fn len(&self) -> usize {
         self.inner.len()
+    }
+
+    fn stream_closed(&self) -> bool {
+        self.inner.stream_closed()
     }
 
     async fn close(mut self) {
