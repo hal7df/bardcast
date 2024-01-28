@@ -1,3 +1,6 @@
+///! Concrete implementations of the [`Interceptor`] and [`LimitingInterceptor`]
+///! traits.
+
 use std::borrow::Cow;
 use std::collections::{HashMap, VecDeque};
 
@@ -11,14 +14,19 @@ use super::super::owned::{OwnedSinkInfo, OwnedSinkInputInfo};
 use super::util;
 use super::{InterceptError, Interceptor, LimitingInterceptor};
 
+/// Caches the original sink ID and cork state of an intercepted audio stream.
 struct InputState {
     orig_sink: u32,
     corked: bool,
 }
 
+/// Implementation of [`Interceptor`] that makes use of 
+/// `Stream::set_monitor_stream()` to directly monitor a single application
+/// without the need for creating virtual sinks. This inherently only allows
+/// a single application to be intercepted at a time.
 pub struct SingleInputMonitor {
     stream_manager: StreamManager,
-    captured: Option<OwnedSinkInputInfo>,
+    intercepted: Option<OwnedSinkInputInfo>,
     volume: Option<f64>,
 }
 
@@ -28,7 +36,7 @@ pub struct SingleInputMonitor {
 pub struct CapturingInterceptor {
     rec: OwnedSinkInfo,
     stream_manager: StreamManager,
-    captures: HashMap<u32, InputState>,
+    intercepts: HashMap<u32, InputState>,
     introspect: AsyncIntrospector,
     volume: Option<f64>,
     limit: Option<usize>,
@@ -42,12 +50,16 @@ pub struct DuplexingInterceptor {
     rec: OwnedSinkInfo,
     orig: OwnedSinkInfo,
     stream_manager: StreamManager,
-    captures: HashMap<u32, InputState>,
+    intercepts: HashMap<u32, InputState>,
     introspect: AsyncIntrospector,
     volume: Option<f64>,
     limit: Option<usize>,
 }
 
+/// Wrapper implementation of [`Interceptor`] that queues intercepted inputs
+/// that would otherwise cause the inner [`LimitingInterceptor`] implementation
+/// to exceed its limit. Queued inputs are dequeued when inputs that were
+/// previously intercepted by the wrapped interceptor are removed.
 pub struct QueuedInterceptor<I> {
     inner: I,
     queue: VecDeque<OwnedSinkInputInfo>,
@@ -55,6 +67,8 @@ pub struct QueuedInterceptor<I> {
 
 /// TYPE IMPLS *****************************************************************
 impl SingleInputMonitor {
+    /// Creates a new `SingleInputMonitor` instance against the given PulseAudio
+    /// context that initializes new streams at the given volume.
     pub async fn new(
         ctx: &PulseContextWrapper,
         volume: Option<f64>
@@ -63,14 +77,19 @@ impl SingleInputMonitor {
 
         (Self {
             stream_manager,
-            captured: None,
+            intercepted: None,
             volume,
         }, stream)
     }
 }
 
 impl CapturingInterceptor {
-    /// Creates a new `CapturingInterceptor`.
+    /// Creates a new `CapturingInterceptor` instance against the given
+    /// PulseAudio context. An optional limit to the number of simultaneously
+    /// intercepted streams can be provided.
+    ///
+    /// The recording stream will be initialized to the provided normalized
+    /// volume, if any.
     pub async fn new(
         ctx: &PulseContextWrapper,
         volume: Option<f64>,
@@ -85,7 +104,7 @@ impl CapturingInterceptor {
         Ok((Self {
             rec,
             stream_manager,
-            captures: HashMap::new(),
+            intercepts: HashMap::new(),
             introspect,
             volume,
             limit
@@ -94,8 +113,10 @@ impl CapturingInterceptor {
 }
 
 impl DuplexingInterceptor {
-    /// Creates a new `DuplexingInterceptor`, using the given sink as the second
-    /// output.
+    /// Creates a new `DuplexingInterceptor` instance against the given
+    /// PulseAudio context, routing audio to the given sink in addition to the
+    /// internally-created record sink. An optional limit to the number of
+    /// simultaneously intercepted streams can be provided.
     pub async fn from_sink(
         ctx: &PulseContextWrapper,
         sink: &OwnedSinkInfo,
@@ -123,7 +144,7 @@ impl DuplexingInterceptor {
             rec,
             orig: sink.clone(),
             stream_manager,
-            captures: HashMap::new(),
+            intercepts: HashMap::new(),
             introspect,
             volume,
             limit
@@ -147,7 +168,7 @@ impl Interceptor for SingleInputMonitor {
         &mut self,
         source: Cow<'a, OwnedSinkInputInfo>
     ) -> Result<(), InterceptError<'a>> {
-        if self.captured.is_some() {
+        if self.intercepted.is_some() {
             return Err(InterceptError::AtCapacity(1usize, source));
         }
 
@@ -163,20 +184,20 @@ impl Interceptor for SingleInputMonitor {
         
         info!("Started monitor of application `{}'", source);
 
-        self.captured = Some(source);
+        self.intercepted = Some(source);
 
 
         Ok(())
     }
 
-    async fn update_capture(
+    async fn update_intercept(
         &mut self,
         source: &OwnedSinkInputInfo
     ) -> Result<(), Code> {
-        if let Some(captured) = self.captured.as_mut() {
-            if captured.index == source.index && captured.corked != source.corked {
-                captured.corked = source.corked;
-                self.stream_manager.set_cork(captured.corked).await
+        if let Some(intercepted) = self.intercepted.as_mut() {
+            if intercepted.index == source.index && intercepted.corked != source.corked {
+                intercepted.corked = source.corked;
+                self.stream_manager.set_cork(intercepted.corked).await
             } else {
                 Ok(())
             }
@@ -186,15 +207,15 @@ impl Interceptor for SingleInputMonitor {
     }
 
     async fn stop(&mut self, source_idx: u32) -> Result<bool, Code> {
-        if let Some(captured) = self.captured.as_ref() {
-            if source_idx != captured.index {
+        if let Some(intercepted) = self.intercepted.as_ref() {
+            if source_idx != intercepted.index {
                 return Ok(false);
             }
 
             debug!("Stopping PulseAudio stream");
             self.stream_manager.stop().await;
-            info!("Stopped monitor of application `{}'", captured);
-            self.captured = None;
+            info!("Stopped monitor of application `{}'", intercepted);
+            self.intercepted = None;
 
             Ok(true)
         } else {
@@ -211,7 +232,7 @@ impl Interceptor for SingleInputMonitor {
     }
 
     fn len(&self) -> usize {
-        if self.captured.is_some() { 1usize } else { 0usize }
+        if self.intercepted.is_some() { 1usize } else { 0usize }
     }
 
     fn stream_closed(&self) -> bool {
@@ -256,7 +277,7 @@ impl Interceptor for CapturingInterceptor {
             self.rec.index
         ).await?;
 
-        self.captures.insert(source.index, InputState {
+        self.intercepts.insert(source.index, InputState {
             orig_sink: source.as_ref().sink,
             corked: source.as_ref().corked,
         });
@@ -266,30 +287,30 @@ impl Interceptor for CapturingInterceptor {
         Ok(())
     }
 
-    async fn update_capture(
+    async fn update_intercept(
         &mut self,
         source: &OwnedSinkInputInfo
     ) -> Result<(), Code> {
-        if let Some(capture) = self.captures.get_mut(&source.index) {
-            if capture.corked == source.corked {
+        if let Some(intercept) = self.intercepts.get_mut(&source.index) {
+            if intercept.corked == source.corked {
                 return Ok(());
             }
 
-            capture.corked = source.corked;
+            intercept.corked = source.corked;
         } else {
             return Ok(());
         }
 
         self.stream_manager.set_cork(
-            self.captures.values().any(|capture| capture.corked)
+            self.intercepts.values().any(|intercept| intercept.corked)
         ).await
     }
 
     async fn stop(&mut self, source_idx: u32) -> Result<bool, Code> {
-        if let Some(capture) = self.captures.get(&source_idx) {
+        if let Some(intercept) = self.intercepts.get(&source_idx) {
             let target_sink = util::get_sink_or_default(
                 &self.introspect,
-                capture.orig_sink
+                intercept.orig_sink
             ).await?;
 
             self.introspect.move_sink_input_by_index(
@@ -297,11 +318,11 @@ impl Interceptor for CapturingInterceptor {
                 target_sink.index
             ).await?;
 
-            self.captures.remove(&source_idx);
+            self.intercepts.remove(&source_idx);
 
             info!("Stopped intercept of application with index {}", source_idx);
 
-            if self.captures.is_empty() {
+            if self.intercepts.is_empty() {
                 debug!("Stopping PulseAudio stream");
                 self.stream_manager.stop().await;
             }
@@ -321,7 +342,7 @@ impl Interceptor for CapturingInterceptor {
     }
 
     fn len(&self) -> usize {
-        self.captures.len()
+        self.intercepts.len()
     }
 
     fn stream_closed(&self) -> bool {
@@ -329,11 +350,11 @@ impl Interceptor for CapturingInterceptor {
     }
 
     async fn close(mut self) {
-        let capture_idxs = self.captures.keys().copied().collect::<Vec<u32>>();
+        let intercept_idxs = self.intercepts.keys().copied().collect::<Vec<u32>>();
 
         interceptor_stop_all(
             &mut self,
-            capture_idxs
+            intercept_idxs
         ).await;
 
         util::tear_down_virtual_sink(&self.introspect, &self.rec, None).await;
@@ -373,7 +394,7 @@ impl Interceptor for DuplexingInterceptor {
             self.demux.index
         ).await?;
 
-        self.captures.insert(source.index, InputState {
+        self.intercepts.insert(source.index, InputState {
             orig_sink: source.as_ref().sink,
             corked: source.as_ref().corked,
         });
@@ -383,30 +404,30 @@ impl Interceptor for DuplexingInterceptor {
         Ok(())
     }
 
-    async fn update_capture(
+    async fn update_intercept(
         &mut self,
         source: &OwnedSinkInputInfo
     ) -> Result<(), Code> {
-        if let Some(capture) = self.captures.get_mut(&source.index) {
-            if capture.corked == source.corked {
+        if let Some(intercept) = self.intercepts.get_mut(&source.index) {
+            if intercept.corked == source.corked {
                 return Ok(());
             }
 
-            capture.corked = source.corked;
+            intercept.corked = source.corked;
         } else {
             return Ok(());
         }
 
         self.stream_manager.set_cork(
-            self.captures.values().any(|capture| capture.corked)
+            self.intercepts.values().any(|intercept| intercept.corked)
         ).await
     }
 
     async fn stop(&mut self, source_idx: u32) -> Result<bool, Code> {
-        if let Some(capture) = self.captures.get(&source_idx) {
+        if let Some(intercept) = self.intercepts.get(&source_idx) {
             let target_sink = util::get_sink_or_default(
                 &self.introspect,
-                capture.orig_sink
+                intercept.orig_sink
             ).await?;
 
             self.introspect.move_sink_input_by_index(
@@ -414,11 +435,11 @@ impl Interceptor for DuplexingInterceptor {
                 target_sink.index
             ).await?;
 
-            self.captures.remove(&source_idx);
+            self.intercepts.remove(&source_idx);
 
             info!("Stopped intercept of application with index {}", source_idx);
 
-            if self.captures.is_empty() {
+            if self.intercepts.is_empty() {
                 debug!("Stopping PulseAudio stream");
                 self.stream_manager.stop().await;
             }
@@ -438,7 +459,7 @@ impl Interceptor for DuplexingInterceptor {
     }
 
     fn len(&self) -> usize {
-        self.captures.len()
+        self.intercepts.len()
     }
 
     fn stream_closed(&self) -> bool {
@@ -446,11 +467,11 @@ impl Interceptor for DuplexingInterceptor {
     }
 
     async fn close(mut self) {
-        let capture_idxs = self.captures.keys().copied().collect::<Vec<u32>>();
+        let intercept_idxs = self.intercepts.keys().copied().collect::<Vec<u32>>();
 
         interceptor_stop_all(
             &mut self,
-            capture_idxs
+            intercept_idxs
         ).await;
 
         //Tear down demux and rec sinks
@@ -497,7 +518,7 @@ impl<I: LimitingInterceptor> Interceptor for QueuedInterceptor<I> {
         }
     }
 
-    async fn update_capture(
+    async fn update_intercept(
         &mut self,
         source: &OwnedSinkInputInfo
     ) -> Result<(), Code> {
@@ -505,7 +526,7 @@ impl<I: LimitingInterceptor> Interceptor for QueuedInterceptor<I> {
             .filter(|queued| queued.index == source.index)
             .for_each(|queued| *queued = source.clone());
 
-        self.inner.update_capture(source).await
+        self.inner.update_intercept(source).await
     }
 
     async fn stop(
@@ -569,6 +590,8 @@ impl<I: LimitingInterceptor> Interceptor for QueuedInterceptor<I> {
 }
 
 // UTILITY FUNCTIONS ***********************************************************
+/// Helper function to stop all intercepts on the given [`Interceptor`]
+/// implementation.
 async fn interceptor_stop_all(
     interceptor: &mut impl Interceptor,
     inputs: impl IntoIterator<Item = u32>

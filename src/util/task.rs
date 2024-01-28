@@ -144,6 +144,8 @@ impl<T> TaskSetBuilder<T> {
 }
 
 impl<T> TaskSet<T> {
+    /// Consumes both `TaskSet`s, and returns a new `TaskSet` containing all
+    /// tasks contained by the original two sets.
     pub fn merge(mut self, mut other: Self) -> Self {
         if let Some(task_fut) = self.0.take() {
             let mut tasks = task_fut.into_inner();

@@ -375,6 +375,8 @@ fn pulse_init(
     ))
 }
 
+/// Helper function to stop the running mainloop task. Logs a warning if the
+/// mainloop task panics.
 async fn stop_mainloop(mainloop_handle: ControlledJoinHandle<()>) {
     if let Err(e) = mainloop_handle.join().await {
         if e.is_panic() {

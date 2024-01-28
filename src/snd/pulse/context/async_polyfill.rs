@@ -231,7 +231,13 @@ impl<'a> Drop for StreamReadFuture<'a> {
     }
 }
 
-// HELPER FUNCTIONS ************************************************************
+// PUBLIC UTILITY FUNCTIONS ****************************************************
+/// Helper function for converting PulseAudio's C-style asynchronous operations
+/// that use the `Operation` type into Rust-compatible `Future`s.
+///
+/// A default/initial value for the result of the future is required, which will
+/// be returned if the `Operation` changes to the `Done` state without returning
+/// any data.
 pub fn operation_to_future<T, S, F>(
     initial_value: T,
     op: F

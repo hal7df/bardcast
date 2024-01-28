@@ -38,6 +38,7 @@ pub struct WavConsumer<'a, P> {
     read_timeout: Option<Duration>,
 }
 
+/// Internal type for storing/transmitting the current state of the WAV writer.
 struct WavWriteState<I> {
     writer: RandomAccessWavWriter<f32>,
     input: I,

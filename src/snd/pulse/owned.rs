@@ -15,6 +15,8 @@ use libpulse::sample::Spec;
 use libpulse::time::MicroSeconds;
 use libpulse::volume::{ChannelVolumes, Volume};
 
+/// The default label used for the `Display` implementation of owned entity
+/// types, if the entity name is missing for some reason.
 const UNKNOWN_ENTITY_LABEL: &'static str = "[unknown]";
 
 // TYPE DEFINITIONS ************************************************************
@@ -182,19 +184,19 @@ impl From<&SourceInfo<'_>> for OwnedSourceInfo {
 
 impl Display for OwnedSinkInfo {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), FormatError> {
-        fmt_name_or_index(f, self.name.as_ref(), self.index)
+        fmt_name_and_index(f, self.name.as_ref(), self.index)
     }
 }
 
 impl Display for OwnedSinkInputInfo {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), FormatError> {
-        fmt_name_or_index(f, self.name.as_ref(), self.index)
+        fmt_name_and_index(f, self.name.as_ref(), self.index)
     }
 }
 
 impl Display for OwnedSourceInfo {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), FormatError> {
-        fmt_name_or_index(f, self.name.as_ref(), self.index)
+        fmt_name_and_index(f, self.name.as_ref(), self.index)
     }
 }
 
@@ -229,7 +231,9 @@ fn map_opt_str(orig: Option<&Cow<'_, str>>) -> Option<String> {
     orig.map(|orig_str| orig_str.to_string())
 }
 
-fn fmt_name_or_index(
+/// Common inner implementation of [`Display`] for owned entity types, printing
+/// the entity's name and index.
+fn fmt_name_and_index(
     f: &mut Formatter<'_>,
     name: Option<&String>,
     index: u32

@@ -1,3 +1,5 @@
+///! Utility functions for stream interceptor code.
+
 use std::process;
 
 use clap::crate_name;

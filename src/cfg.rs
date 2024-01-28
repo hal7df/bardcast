@@ -425,6 +425,8 @@ fn validate_log_level(raw_level: &Option<String>) -> Result<Option<LevelFilter>,
     }).transpose()
 }
 
+/// Converts the given millisecond stream timeout into a [`Duration`] instance,
+/// returning a validation error if not otherwise possible.
 fn validate_stream_timeout(raw_timeout: &Result<Option<u64>, String>) -> Result<Option<Duration>, String> {
     raw_timeout.as_ref().map(|timeout| timeout.map(
             |timeout_ms| Duration::from_millis(timeout_ms)

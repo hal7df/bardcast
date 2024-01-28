@@ -87,6 +87,7 @@ pub fn list_drivers() {
 }
 
 // HELPER FUNCTIONS ************************************************************
+/// Attempts to start the provided audio consumer with the given audio stream.
 async fn start_consumer<S: AudioStream + Send + Sync + 'static>(
     consumer: impl AudioConsumer,
     stream: S,

@@ -89,6 +89,9 @@ struct MediaSourceAdapter<R>(R);
 
 // TYPE IMPLS ******************************************************************
 impl<'a> DiscordConsumer<'a> {
+    /// Creates a new `DiscordConsumer` instance. If `read_timeout` is `None`,
+    /// the asynchronous read timeout will be the default specified by
+    /// [`crate::snd::types::SyncStreamAdapter`].
     pub fn new(cfg: &'a DiscordConfig, read_timeout: Option<Duration>) -> Self {
         Self(cfg, read_timeout)
     }
@@ -425,12 +428,18 @@ fn enumerate_guilds<'a>(
     ).try_flatten_iters()
 }
 
+/// Stops playback of a specific track, logging an error if the operation fails.
 fn stop_playback(playback: &TrackHandle) {
     if let Err(e) = playback.stop() {
         warn!("Failed to gracefully stop audio playback: {}", e);
     }
 }
 
+/// Monitors the state of the playback stream and playback handle.
+///
+/// If the track drops the [`crate::util::Lease`] object wrapping the input
+/// stream, this will reclaim the stream and attempt to start playback again
+/// when the stream indicates that data is being written to it again.
 async fn monitor_playback<S>(
     stream: &mut Lessor<S>,
     call: &Arc<Mutex<Call>>,

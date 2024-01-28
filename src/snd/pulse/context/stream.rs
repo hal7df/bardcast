@@ -50,59 +50,102 @@ const SAMPLE_SPEC: SampleSpec = SampleSpec {
     rate: SAMPLE_RATE,
 };
 
+/// The maximum number of consecutive non-fatal stream read errors that are
+/// allowed before the stream task automatically terminates.
 const MAX_CONSECUTIVE_ERRORS: usize = 3;
 
+/// Capacity of the stream queue.
 const COMMAND_QUEUE_SIZE: usize = 3;
 
 // TYPE DEFINITIONS ************************************************************
+/// Trait for configuring a stream to read from an implementation-specified
+/// source. Responsible for calling `Stream::record()`.
+///
+/// This is typically a PulseAudio source object or sink input.
 pub trait StreamConfig {
+    /// Configures the given unconfigured stream object for the audio source
+    /// specified by the implementation. This must generally call
+    /// `Stream::record()`.
     fn configure(&self, stream: Stream) -> Result<Stream, Code>;
 }
 
+/// Helper trait for resolving partial stream source information into a
+/// fully-resolved [`StreamConfig`] object.
+///
+/// A null automatic implementation is provided for all types that implement
+/// `StreamConfig`.
 #[async_trait]
 pub trait IntoStreamConfig {
+    /// The `StreamConfig` type that this resolves to.
     type Target: StreamConfig + Send + 'static;
 
+    /// Resolves this object for use for configuring an audio stream.
     async fn resolve(
         self,
         introspect: &AsyncIntrospector
     ) -> Result<Self::Target, Code>;
 }
 
+/// Represents the possible outcomes of processing a call to `Stream::peek()`.
 enum StreamWriteResult {
+    /// Audio data was written to the internal stream handle.
     DataWritten,
+
+    /// A PulseAudio error occurred when attempting to read stream data.
     PulseError(Code),
+
+    /// The receiving end attached to the internal stream handle closed,
+    /// preventing any further writes.
     HandleClosed,
+
+    /// No action was performed, nor was any actionable condition encountered.
     NoOp,
 }
 
+/// Commands that can be sent to the stream handler task.
 enum StreamCommand {
+    /// Instructs the stream handler task to cork or uncork the stream,
+    /// according to the `bool` parameter. The result of the operation is
+    /// transmitted via tha provided channel.
     SetCork(bool, OneshotSender<Result<(), Code>>),
+
+    /// Instructs the stream handler task to shut down.
     Shutdown,
 }
 
+/// Type alias for generic, asynchronous ring buffer consumers.
 type Consumer<T> = AsyncConsumer<T, Arc<AsyncRb<T, HeapRb<T>>>>;
 
+/// Type alias for generic, asynchronous ring buffer producers.
 type Producer<T> = AsyncProducer<T, Arc<AsyncRb<T, HeapRb<T>>>>;
 
 /// Type alias for the concrete audio consumer type.
 pub type SampleConsumer = Consumer<u8>;
 
+/// Manages the producing end of the application-internal stream, allowing one
+/// stream handle to be reused for different `Stream` instances.
 pub struct StreamManager {
     ctx: PulseContextWrapper,
     sample_tx: Lessor<Producer<u8>>,
     task: Option<(Producer<StreamCommand>, JoinHandle<()>)>,
 }
 
+/// Represents a unique identifier for a PulseAudio sink.
 pub enum SinkId<'a> {
     Index(u32),
     Name(&'a str),
 }
 
+/// Allows a sink input to be used as a `StreamConfig` (sink inputs by
+/// themselves do not provide the name of the sink monitor, so this caches the
+/// name of the associated sink monitor after lookup).
 pub struct ResolvedSinkInput(OwnedSinkInputInfo, OwnedSinkInfo);
 
 // TYPE IMPLS ******************************************************************
 impl StreamManager {
+    /// Creates a new `StreamManager` against the given PulseAudio context. The
+    /// consuming end of the application-internal stream is returned in addition
+    /// to the manager instance.
     pub fn new(ctx: &PulseContextWrapper) -> (Self, Consumer<u8>) {
         let (tx, rx) = AsyncRb::<u8, HeapRb<u8>>::new(SAMPLE_QUEUE_SIZE).split();
 
@@ -113,14 +156,26 @@ impl StreamManager {
         }, rx)
     }
 
+    /// Checks if the PulseAudio `Stream` is being actively read.
     pub fn is_running(&self) -> bool {
         self.task.is_some()
     }
 
+    /// Checks if the consuming end of the application-internal stream is
+    /// closed.
+    ///
+    /// Due to technical limitations, this assumes that the stream is open
+    /// while [`is_running()`] returns `true`; the stream handler task is
+    /// expected to automatically shut down when the consumer is dropped.
     pub fn is_closed(&self) -> bool {
         self.sample_tx.as_ref().is_some_and(|tx| tx.is_closed())
     }
 
+    /// Corks or uncorks the active stream. If there is no active stream, this
+    /// returns `Err(Code::NoEntity)`.
+    ///
+    /// If `cork` is `true`, the stream will be corked; if `cork` is `false`,
+    /// the stream will be uncorked.
     pub async fn set_cork(&mut self, cork: bool) -> Result<(), Code> {
         if let Some((cmd_tx, _)) = self.task.as_mut() {
             let (tx, rx) = oneshot::channel::<Result<(), Code>>();
@@ -135,6 +190,9 @@ impl StreamManager {
         }
     }
 
+    /// Monitors the state/health of the stream handler task. The owner of the
+    /// `StreamManager` should call this function while [`is_running()`]
+    /// returns true.
     pub async fn monitor(&mut self) {
         let panic_obj = if let Some((_, task_handle)) = self.task.as_mut() {
             let task_res = task_handle.await;
@@ -165,6 +223,8 @@ impl StreamManager {
         self.sample_tx.await_release().await;
     }
 
+    /// Starts recording audio into the application-internal stream from the
+    /// given `source` at the given normalized `volume`.
     pub async fn start<'a>(
         &'a mut self,
         source: impl IntoStreamConfig + 'a,
@@ -201,6 +261,8 @@ impl StreamManager {
         }
     }
 
+    /// Stops any current audio recording. If [`is_running()`] is false, this
+    /// does nothing.
     pub async fn stop(&mut self) {
         if let Some((mut cmd_tx, task_handle)) = self.task.take() {
             if cmd_tx.push(StreamCommand::Shutdown).await.is_err() && !task_handle.is_finished() {
@@ -223,6 +285,8 @@ impl StreamManager {
 }
 
 impl<'a> SinkId<'a> {
+    /// Disambiguates between a sink index and a sink name, returning an
+    /// optional `SinkId` object accordingly.
     pub fn merged(index: Option<u32>, name: Option<&'a str>) -> Option<Self> {
         if let Some(index) = index {
             Some(Self::Index(index))
@@ -252,6 +316,8 @@ impl<I> IntoStreamConfig for Option<I>
 where I: IntoStreamConfig<Target = OwnedSinkInfo> + Send {
     type Target = OwnedSinkInfo;
 
+    /// Calls the internal [`resolve()`] implementation if `Self` is `Some`,
+    /// otherwise, looks up and returns the system default sink.
     async fn resolve(
         self,
         introspect: &AsyncIntrospector
@@ -404,6 +470,9 @@ impl Drop for StreamManager {
 }
 
 // HELPER FUNCTIONS ************************************************************
+/// Core implementation for recording audio from a `Stream`.
+///
+/// Data will be read into `sample_tx`.
 async fn stream_read(
     stream: &mut Stream,
     sample_tx: &mut Producer<u8>
@@ -453,6 +522,10 @@ async fn stream_read(
     }
 }
 
+/// Main event loop for the stream handler task.
+///
+/// This monitors both the `cmd_rx` channel for commands, and the stream object
+/// for new data.
 async fn do_stream(
     mut stream: Stream,
     mut sample_tx: Lease<Producer<u8>>,
@@ -561,6 +634,8 @@ async fn do_stream(
     }
 }
 
+/// Helper function to disconnect a `Stream`. Logs a warning if the stream fails
+/// to disconnect.
 fn stream_disconnect(
     stream: &mut Stream,
     notify: StreamReadNotifier

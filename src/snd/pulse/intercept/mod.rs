@@ -69,10 +69,10 @@ trait Interceptor: Send + Sync {
         source: Cow<'a, OwnedSinkInputInfo>
     ) -> Result<(), InterceptError<'a>>;
 
-    /// Updates the stream metadata for the given captured stream. This may
-    /// cork or uncork the stream depending on the cork state of all captured
+    /// Updates the stream metadata for the given intercepted stream. This may
+    /// cork or uncork the stream depending on the cork state of all intercepted
     /// applications.
-    async fn update_capture(
+    async fn update_intercept(
         &mut self,
         source: &OwnedSinkInputInfo
     ) -> Result<(), Code>;
@@ -171,6 +171,22 @@ impl Display for InterceptError<'_> {
 impl Error for InterceptError<'_> {}
 
 // PUBLIC HELPER FUNCTIONS *****************************************************
+/// Primary entry point for all interceptors.
+///
+/// This automatically determines the appropriate interceptor implementation
+/// from `mode` and `limit`.
+///
+/// The value of `sink` is ignored by the `Capture` intercept mode, and the
+/// `Monitor` intercept mode when `limit` is `Some(1)`, as no existing sink is
+/// needed for these intercept modes to function properly.
+///
+/// The provided event listener should be configured to perform any necessary
+/// filtering of events prior to being passed to this function. Events **MUST
+/// NOT** be filtered by type, as the interceptor logic needs to be notified of
+/// all entity lifecycle events.
+///
+/// The interceptor will ignore `Changed` and `Removed` events that do not match
+/// any current intercepts.
 pub async fn start<L>(
     ctx: &PulseContextWrapper,
     sink: impl IntoStreamConfig<Target = OwnedSinkInfo>,
@@ -244,6 +260,8 @@ where
 }
 
 // HELPER FUNCTIONS ************************************************************
+/// Generic implementation of `start()`, for use with a configured
+/// [`Interceptor`] instance.
 async fn run<L>(
     mut intercept: impl Interceptor,
     mut listen: L
@@ -281,7 +299,7 @@ where
                     }
                 },
                 Ok(ChangeEvent::Changed(AudioEntity::Info(input))) => {
-                    if let Err(e) = intercept.update_capture(&input).await {
+                    if let Err(e) = intercept.update_intercept(&input).await {
                         warn!(
                             "Failed to read status update for application with \
                              index {} (error: {}). This may prevent audio from \

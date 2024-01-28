@@ -163,6 +163,9 @@ fn validate_volume(raw_volume: Option<f64>) -> Result<Option<f64>, String> {
     }
 }
 
+/// Converts the `u64` raw intercept limit into a `usize`. If the limit cannot
+/// be represented by a `usize`, a warning message is printed and the limit is
+/// ignored.
 fn process_intercept_limit(intercept_limit_u64: Option<u64>) -> Option<usize> {
     intercept_limit_u64.and_then(|n_u64| {
         if let Ok(n_usize) = usize::try_from(n_u64) {

@@ -14,6 +14,8 @@ use futures::io::{AsyncRead, AsyncReadExt};
 use ringbuf::ring_buffer::RbRef;
 use tokio::runtime::{Builder as TokioRuntimeBuilder, Runtime};
 
+/// The default timeout for [`SyncStreamAdapter`], if none is otherwise
+/// specified.
 const DEFAULT_ASYNC_READ_TIMEOUT: Duration = Duration::from_millis(250u64);
 
 // TYPE DEFINITIONS ************************************************************
@@ -32,7 +34,10 @@ pub trait StreamNotifier {
 
 /// Base trait for types that can be converted into readable audio streams.
 pub trait AudioStream {
+    /// The concrete implementation returned by `into_async_stream`.
     type AsyncImpl: AsyncRead + StreamNotifier + Unpin + Send + Sync + 'static;
+
+    /// The concrete implementation returned by `into_sync_stream`.
     type SyncImpl: Read + StreamNotifier + Send + Sync + 'static;
 
     /// Converts this `AudioStream` into a usable Read + StreamNotifier
