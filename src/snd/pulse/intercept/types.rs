@@ -313,10 +313,22 @@ impl Interceptor for CapturingInterceptor {
                 intercept.orig_sink
             ).await?;
 
-            self.introspect.move_sink_input_by_index(
+            let move_res = self.introspect.move_sink_input_by_index(
                 source_idx,
                 target_sink.index
-            ).await?;
+            ).await;
+
+            if let Err(e) = move_res {
+                if e == Code::NoEntity {
+                    info!(
+                        "Could not restore sink configuration for application \
+                         with index {} as it no longer exists",
+                         source_idx
+                    );
+                } else {
+                    return Err(e)
+                }
+            }
 
             self.intercepts.remove(&source_idx);
 
@@ -430,10 +442,22 @@ impl Interceptor for DuplexingInterceptor {
                 intercept.orig_sink
             ).await?;
 
-            self.introspect.move_sink_input_by_index(
+            let move_res = self.introspect.move_sink_input_by_index(
                 source_idx,
                 target_sink.index
-            ).await?;
+            ).await;
+
+            if let Err(e) = move_res {
+                if e == Code::NoEntity {
+                    info!(
+                        "Could not restore sink configuration for application \
+                         with index {} as it no longer exists",
+                         source_idx
+                    );
+                } else {
+                    return Err(e)
+                }
+            }
 
             self.intercepts.remove(&source_idx);
 

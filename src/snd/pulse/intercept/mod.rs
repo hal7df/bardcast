@@ -6,7 +6,7 @@
 ///! functionality of the [`super::event`] module, this allows applications to
 ///! be efficiently intercepted as soon as they open an audio stream.
 
-mod concrete;
+mod types;
 mod util;
 
 use std::borrow::Cow;
@@ -20,7 +20,7 @@ use tokio::sync::broadcast::error::RecvError;
 
 use crate::cfg::InterceptMode;
 use crate::util::task::ValueJoinHandle;
-use self::concrete::{
+use self::types::{
     CapturingInterceptor,
     DuplexingInterceptor,
     SingleInputMonitor,
