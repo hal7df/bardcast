@@ -313,21 +313,18 @@ impl Interceptor for CapturingInterceptor {
                 intercept.orig_sink
             ).await?;
 
-            let move_res = self.introspect.move_sink_input_by_index(
+            match checked_move(
+                &self.introspect,
                 source_idx,
                 target_sink.index
-            ).await;
-
-            if let Err(e) = move_res {
-                if e == Code::NoEntity {
-                    info!(
-                        "Could not restore sink configuration for application \
-                         with index {} as it no longer exists",
-                         source_idx
-                    );
-                } else {
-                    return Err(e)
-                }
+            ).await {
+                Ok(_) => {},
+                Err(Code::NoEntity) => info!(
+                    "Could not restore sink configuration for application with
+                     index {} as it no longer exists",
+                    source_idx
+                ),
+                Err(e) => return Err(e),
             }
 
             self.intercepts.remove(&source_idx);
@@ -442,21 +439,18 @@ impl Interceptor for DuplexingInterceptor {
                 intercept.orig_sink
             ).await?;
 
-            let move_res = self.introspect.move_sink_input_by_index(
+            match checked_move(
+                &self.introspect,
                 source_idx,
                 target_sink.index
-            ).await;
-
-            if let Err(e) = move_res {
-                if e == Code::NoEntity {
-                    info!(
-                        "Could not restore sink configuration for application \
-                         with index {} as it no longer exists",
-                         source_idx
-                    );
-                } else {
-                    return Err(e)
-                }
+            ).await {
+                Ok(_) => {},
+                Err(Code::NoEntity) => info!(
+                    "Could not restore sink configuration for application with \
+                     index {} as it no longer exists",
+                    source_idx
+                ),
+                Err(e) => return Err(e)
             }
 
             self.intercepts.remove(&source_idx);
@@ -614,6 +608,18 @@ impl<I: LimitingInterceptor> Interceptor for QueuedInterceptor<I> {
 }
 
 // UTILITY FUNCTIONS ***********************************************************
+async fn checked_move(
+    introspect: &AsyncIntrospector,
+    input_idx: u32,
+    target_sink_idx: u32
+) -> Result<(), Code> {
+    // We don't care about Ok() value of the result here, this just checks
+    // whether the sink input exists
+    introspect.get_sink_input(input_idx).await?;
+
+    introspect.move_sink_input_by_index(input_idx, target_sink_idx).await
+}
+
 /// Helper function to stop all intercepts on the given [`Interceptor`]
 /// implementation.
 async fn interceptor_stop_all(
