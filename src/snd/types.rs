@@ -6,13 +6,14 @@ use std::fmt::{Display, Error as FormatError, Formatter};
 use std::io::{Error as IoError, ErrorKind, Read};
 use std::time::Duration;
 
+use async_io::Timer;
 use async_ringbuf::consumer::AsyncConsumer;
 use async_ringbuf::ring_buffer::AsyncRbRead;
 use async_trait::async_trait;
+use futures::executor;
 use futures::future::{self, Either};
 use futures::io::{AsyncRead, AsyncReadExt};
 use ringbuf::ring_buffer::RbRef;
-use tokio::runtime::{Builder as TokioRuntimeBuilder, Runtime};
 
 /// The default timeout for [`SyncStreamAdapter`], if none is otherwise
 /// specified.
@@ -59,7 +60,6 @@ pub trait AudioStream {
 /// blocking [`Read`] is required, with a configurable read timeout.
 pub struct SyncStreamAdapter<A> {
     reader: A,
-    runtime: Option<Runtime>,
     async_timeout: Duration,
 }
 
@@ -117,7 +117,6 @@ impl<A: AsyncRead + Unpin> SyncStreamAdapter<A> {
     pub fn new(reader: A, async_timeout: Option<Duration>) -> Self {
         Self {
             reader,
-            runtime: None,
             async_timeout: async_timeout.unwrap_or(DEFAULT_ASYNC_READ_TIMEOUT),
         }
     }
@@ -170,22 +169,10 @@ impl<A> BorrowMut<A> for SyncStreamAdapter<A> {
 
 impl<A: AsyncRead + Unpin> Read for SyncStreamAdapter<A> {
     fn read(&mut self, buf: &mut [u8]) -> Result<usize, IoError> {
-        if self.runtime.is_none() {
-            self.runtime = Some(TokioRuntimeBuilder::new_current_thread()
-                .enable_time()
-                .build()?
-            )
-        }
-
-        self.runtime.as_ref().expect(
-            "SyncStreamAdapter should have an initialized Runtime"
-        ).block_on(async {
-            let timeout = tokio::time::sleep(self.async_timeout);
-            tokio::pin!(timeout);
-
+        executor::block_on(async {
             let timed_read_res = future::select(
                 self.reader.read(buf),
-                timeout
+                Timer::after(self.async_timeout)
             ).await;
 
             match timed_read_res {
