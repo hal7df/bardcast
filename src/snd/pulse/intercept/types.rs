@@ -3,6 +3,8 @@
 
 use std::borrow::Cow;
 use std::collections::{HashMap, VecDeque};
+use std::error::Error;
+use std::fmt::{Display, Error as FormatError, Formatter};
 
 use async_trait::async_trait;
 use libpulse_binding::error::Code;
@@ -12,7 +14,95 @@ use super::super::context::{AsyncIntrospector, PulseContextWrapper};
 use super::super::context::stream::{SampleConsumer, StreamManager};
 use super::super::owned::{OwnedSinkInfo, OwnedSinkInputInfo};
 use super::util;
-use super::{InterceptError, Interceptor, LimitingInterceptor};
+
+// TYPE DEFINITIONS ************************************************************
+/// Represents possible error modes for [`Interceptor::record()`].
+#[derive(Debug)]
+pub enum InterceptError<'a> {
+    /// PulseAudio returned an error while attempting to intercept the
+    /// application.
+    PulseError(Code),
+
+    /// The interceptor cannot concurrently intercept any more applications.
+    AtCapacity(usize, Cow<'a, OwnedSinkInputInfo>),
+}
+
+/// Core abstraction for intercepting application audio.
+///
+/// The main function in this interface is [`intercept`], which performs the
+/// work of intercepting applications and routing them such that bardcast can
+/// read their stream. This interface also provides a few functions to query the
+/// current state of intercepted streams.
+#[async_trait]
+pub trait Interceptor: Send + Sync {
+    /// Starts recording audio from the given application.
+    async fn record<'a>(
+        &mut self,
+        source: Cow<'a, OwnedSinkInputInfo>
+    ) -> Result<(), InterceptError<'a>>;
+
+    /// Updates the stream metadata for the given intercepted stream. This may
+    /// cork or uncork the stream depending on the cork state of all intercepted
+    /// applications.
+    async fn update_intercept(
+        &mut self,
+        source: &OwnedSinkInputInfo
+    ) -> Result<(), Code>;
+
+    /// Stops recording audio from the given application. If this interceptor
+    /// is not currently recording audio from the given application, this
+    /// returns `Ok(false)`.
+    async fn stop(
+        &mut self,
+        source_idx: u32
+    ) -> Result<bool, Code>;
+
+    /// Determines if [`Interceptor::monitor()`] must be called to ensure
+    /// underlying tasks are properly monitored and cleaned up during normal
+    /// operation.
+    fn needs_monitor(&self) -> bool;
+
+    /// Monitors and cleans up underlying tasks, if any.
+    async fn monitor(&mut self);
+
+    /// Returns the number of applications that have been intercepted by this
+    /// interceptor.
+    fn len(&self) -> usize;
+
+    /// Determines whether the consuming end of the stream has closed.
+    fn stream_closed(&self) -> bool;
+
+    /// Gracefully closes any system resources that were created by the
+    /// `Interceptor`, returning any intercepted streams to another audio device
+    /// if needed.
+    async fn close(mut self);
+}
+
+/// Specialization of [`Interceptor`] that allows for limits on the number of
+/// concurrently captured applications.
+pub trait LimitingInterceptor: Interceptor {
+    /// Returns the number of concurrent applications that can be intercepted
+    /// by this `LimitedInterceptor` instance.
+    ///
+    /// Returns `None` if there is no limit applied to this interceptor.
+    fn capacity(&self) -> Option<usize>;
+
+    /// Returns the number of additional applications that can be concurrently
+    /// intercepted by this `LimitedInterceptor` instance.
+    ///
+    /// Returns `None` if there is no limit applied to this interceptor.
+    fn remaining(&self) -> Option<usize> {
+        self.capacity().map(|capacity| capacity - self.len())
+    }
+
+    /// Determines whether this interceptor has intercepted the maximum number
+    /// of concurrent applications.
+    ///
+    /// This will always be `false` for interceptors with no limit.
+    fn is_full(&self) -> bool {
+        self.remaining().is_some_and(|remaining| remaining == 0)
+    }
+}
 
 /// Caches the original sink ID and cork state of an intercepted audio stream.
 struct InputState {
@@ -75,6 +165,8 @@ impl SingleInputMonitor {
     ) -> (Self, SampleConsumer) {
         let (stream_manager, stream) = StreamManager::new(ctx);
 
+        debug!("SingleInputMonitor initialized");
+
         (Self {
             stream_manager,
             intercepted: None,
@@ -100,6 +192,8 @@ impl CapturingInterceptor {
         debug!("Created rec sink at index {}", rec.index);
 
         let (stream_manager, stream) = StreamManager::new(ctx);
+
+        debug!("CapturingInterceptor initialized");
 
         Ok((Self {
             rec,
@@ -139,6 +233,8 @@ impl DuplexingInterceptor {
 
         let (stream_manager, stream) = StreamManager::new(ctx);
 
+        debug!("DuplexingInterceptor initialized");
+
         Ok((Self {
             demux,
             rec,
@@ -152,9 +248,91 @@ impl DuplexingInterceptor {
     }
 }
 
+impl<I> QueuedInterceptor<I> {
+    /// Searches the queue for the first uncorked sink input, removes it, and
+    /// returns it. If there are no uncorked sink inputs, or the queue is empty,
+    /// returnes `None`.
+    fn get_top_uncorked_input(&mut self) -> Option<OwnedSinkInputInfo> {
+        let next_idx = self.queue.iter().enumerate()
+            .find_map(|(i, input)| if !input.corked { Some(i) } else { None });
+
+        if let Some(next_idx) = next_idx {
+            self.queue.remove(next_idx)
+        } else {
+            None
+        }
+    }
+}
+
+impl<I: LimitingInterceptor> QueuedInterceptor<I> {
+    /// Finds the first uncorked sink input in the queue and passes it to the
+    /// underlying interceptor. If the interceptor is at capacity, the sink
+    /// input will be requeued at the end.
+    async fn attempt_queued_intercept(&mut self) -> Result<(), Code> {
+        if let Some(next_source) = self.get_top_uncorked_input() {
+            info!(
+                "Attempting to intercept previously queued application `{}'",
+                next_source
+            );
+
+            match self.record(Cow::Owned(next_source)).await {
+                Ok(()) => Ok(()),
+                Err(InterceptError::PulseError(e)) => Err(e),
+                Err(InterceptError::AtCapacity(..)) => unreachable!(
+                    "QueuedInterceptor::record() should never return \
+                     InterceptError::AtCapacity"
+                ),
+            }
+        } else {
+            Ok(())
+        }
+    }
+}
+
 // TRAIT IMPLS *****************************************************************
+impl From<Code> for InterceptError<'_> {
+    fn from(code: Code) -> Self {
+        Self::PulseError(code)
+    }
+}
+
+impl<'a> TryFrom<InterceptError<'a>> for Code {
+    type Error = InterceptError<'a>;
+
+    fn try_from(err: InterceptError<'a>) -> Result<Self, Self::Error> {
+        if let InterceptError::PulseError(code) = err {
+            Ok(code)
+        } else {
+            Err(err)
+        }
+    }
+}
+
+impl Display for InterceptError<'_> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), FormatError> {
+        match self {
+            Self::PulseError(code) => code.fmt(f),
+            Self::AtCapacity(limit, source) => write!(
+                f,
+                "Cannot intercept application {}, interceptor at limit ({})",
+                source.as_ref(),
+                limit
+            ),
+        }
+    }
+}
+
+/// Due to lifetime constraints, `InterceptError` cannot correctly implement
+/// [`Error::source()`]. To get a [`Code`] from an `InterceptError`, use
+/// [`Code::try_from`].
+impl Error for InterceptError<'_> {}
+
 impl<I: LimitingInterceptor> From<I> for QueuedInterceptor<I> {
     fn from(interceptor: I) -> Self {
+        debug!(
+            "QueuedInterceptor initialized (limit: {:?})",
+            interceptor.capacity()
+        );
         Self {
             inner: interceptor,
             queue: VecDeque::new(),
@@ -185,7 +363,6 @@ impl Interceptor for SingleInputMonitor {
         info!("Started monitor of application `{}'", source);
 
         self.intercepted = Some(source);
-
 
         Ok(())
     }
@@ -282,6 +459,10 @@ impl Interceptor for CapturingInterceptor {
             corked: source.as_ref().corked,
         });
 
+        self.stream_manager.set_cork(
+            self.intercepts.values().all(|intercept| intercept.corked)
+        ).await?;
+
         info!("Intercepted application `{}'", source);
 
         Ok(())
@@ -302,7 +483,7 @@ impl Interceptor for CapturingInterceptor {
         }
 
         self.stream_manager.set_cork(
-            self.intercepts.values().any(|intercept| intercept.corked)
+            self.intercepts.values().all(|intercept| intercept.corked)
         ).await
     }
 
@@ -408,6 +589,10 @@ impl Interceptor for DuplexingInterceptor {
             corked: source.as_ref().corked,
         });
 
+        self.stream_manager.set_cork(
+            self.intercepts.values().all(|intercept| intercept.corked)
+        ).await?;
+
         info!("Intercepted application `{}'", source);
 
         Ok(())
@@ -428,7 +613,7 @@ impl Interceptor for DuplexingInterceptor {
         }
 
         self.stream_manager.set_cork(
-            self.intercepts.values().any(|intercept| intercept.corked)
+            self.intercepts.values().all(|intercept| intercept.corked)
         ).await
     }
 
@@ -518,6 +703,20 @@ impl<I: LimitingInterceptor> Interceptor for QueuedInterceptor<I> {
         &mut self,
         source: Cow<'a, OwnedSinkInputInfo>
     ) -> Result<(), InterceptError<'a>> {
+        // Send corked streams straight to the queue if they're corked. The user
+        // probably doesn't want corked streams using up interceptor capacity.
+        if source.corked {
+            info!(
+                "Not intercepting matching application `{}', as it is not \
+                 currently playing audio. It will be queued and intercepted \
+                 later when it starts playing audio, and the interceptor has \
+                 capacity.",
+                source
+            );
+            self.queue.push_back(source.into_owned());
+            return Ok(());
+        }
+
         match self.inner.record(source).await {
             Ok(()) => Ok(()),
             Err(InterceptError::AtCapacity(n, source)) => {
@@ -544,7 +743,15 @@ impl<I: LimitingInterceptor> Interceptor for QueuedInterceptor<I> {
             .filter(|queued| queued.index == source.index)
             .for_each(|queued| *queued = source.clone());
 
-        self.inner.update_intercept(source).await
+        self.inner.update_intercept(source).await?;
+
+        // If there is capacity and the change is due to an application
+        // uncorking, then allow it to be intercepted
+        if !self.inner.is_full() {
+            self.attempt_queued_intercept().await
+        } else {
+            Ok(())
+        }
     }
 
     async fn stop(
@@ -564,23 +771,7 @@ impl<I: LimitingInterceptor> Interceptor for QueuedInterceptor<I> {
         });
 
         if self.inner.stop(source_idx).await? {
-            if let Some(next_source) = self.queue.pop_front() {
-                info!(
-                    "Attempting to intercept previously queued application `{}'",
-                    next_source
-                );
-
-                match self.record(Cow::Owned(next_source)).await {
-                    Ok(()) => Ok(true),
-                    Err(InterceptError::PulseError(e)) => Err(e),
-                    Err(InterceptError::AtCapacity(..)) => unreachable!(
-                        "QueuedInterceptor::record() should never return \
-                         InterceptError::AtCapacity"
-                    ),
-                }
-            } else {
-                Ok(true)
-            }
+            self.attempt_queued_intercept().await.map(|_| true)
         } else {
             Ok(false)
         }
