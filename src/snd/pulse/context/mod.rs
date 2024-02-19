@@ -3,20 +3,19 @@
 mod async_polyfill;
 pub mod collect;
 mod introspect;
+pub mod stream;
 
 extern crate libpulse_binding as libpulse;
 
 use std::cmp;
 use std::future::Future;
 use std::mem;
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Mutex, Weak};
 use std::time::{Duration, Instant};
 
-use async_ringbuf::{AsyncConsumer, AsyncProducer, AsyncRb};
 use clap::crate_name;
 use itertools::Itertools;
 use log::{debug, error, warn, trace};
-use ringbuf::HeapRb;
 use tokio::sync::mpsc::{
     self,
     Sender as MpscSender,
@@ -24,31 +23,18 @@ use tokio::sync::mpsc::{
 };
 use tokio::sync::oneshot::{
     self,
-    Receiver as OneshotReceiver,
-    Sender as OneshotSender
+    Receiver as OneshotReceiver
 };
-use tokio::task::{self, JoinError, JoinHandle};
+use tokio::task::{self, JoinHandle};
 use tokio::time;
 
-use libpulse::channelmap::Map as ChannelMap;
 use libpulse::context::{Context, FlagSet, State as ContextState};
 use libpulse::error::Code;
 use libpulse::mainloop::standard::{IterateResult, Mainloop};
 use libpulse::operation::{Operation, State as OperationState};
-use libpulse::sample::{Format as SampleFormat, Spec as SampleSpec};
-use libpulse::stream::{
-    FlagSet as StreamFlagSet,
-    PeekResult,
-    State as StreamState,
-    Stream
-};
 
-use self::async_polyfill::{
-    InitializingFuture,
-    StreamReadNotifier
-};
-use crate::util;
-use crate::util::task::ValueJoinHandle;
+use self::async_polyfill::InitializingFuture;
+use crate::util::task::{ControlledJoinHandle, ValueJoinHandle};
 
 // RE-EXPORTS ******************************************************************
 pub use self::introspect::AsyncIntrospector;
@@ -58,21 +44,6 @@ pub use self::introspect::AsyncIntrospector;
 /// The maximum number of context operations that can be queued at once.
 const OP_QUEUE_SIZE: usize = 32;
 
-/// The audio sample rate in Hz. Per the driver specification, this must be
-/// 48 kHz.
-const SAMPLE_RATE: u32 = 48000;
-
-/// The size of the sample buffer in bytes.
-const SAMPLE_QUEUE_SIZE: usize = SAMPLE_RATE as usize * 2;
-
-/// PulseAudio [`SampleSpec`] definition matching the requirements of the driver
-/// specification.
-const SAMPLE_SPEC: SampleSpec = SampleSpec {
-    format: SampleFormat::F32le,
-    channels: 2,
-    rate: SAMPLE_RATE,
-};
-
 /// The default maximum interval between mainloop iterations.
 const DEFAULT_MAINLOOP_MAX_INTERVAL: Duration = Duration::from_millis(20);
 
@@ -81,9 +52,6 @@ const DEFAULT_MAINLOOP_MAX_INTERVAL: Duration = Duration::from_millis(20);
 const MAINLOOP_ITER_TRACKING_LEN: usize = 5;
 
 // TYPE DEFINITIONS ************************************************************
-
-/// Type alias for the concrete audio consumer type.
-pub type SampleConsumer = AsyncConsumer<u8, Arc<AsyncRb<u8, HeapRb<u8>>>>;
 
 /// Type alias for submitted context operations.
 type ContextThunk = Box<dyn FnOnce(&mut Context) + Send + 'static>;
@@ -95,9 +63,7 @@ type ContextThunk = Box<dyn FnOnce(&mut Context) + Send + 'static>;
 /// functions against the context serially, allowing other tasks to interact
 /// with PulseAudio from multiple threads.
 #[derive(Clone)]
-pub struct PulseContextWrapper {
-    op_queue: MpscSender<ContextThunk>,
-}
+pub struct PulseContextWrapper(MpscSender<ContextThunk>);
 
 /// Utility type for managing the mainloop.
 ///
@@ -113,9 +79,6 @@ struct MainloopHandler {
     max_interval: Duration,
 }
 
-/// A handle to cancel an actively running [`MainloopHandler`].
-struct MainloopHandle(OneshotSender<()>, JoinHandle<()>);
-
 // TYPE IMPLS ******************************************************************
 impl PulseContextWrapper {
     /// Creates a new wrapper instance, returning the new instance wrapped in a
@@ -124,13 +87,13 @@ impl PulseContextWrapper {
     pub async fn new(
         server: Option<&str>,
         max_mainloop_interval_usec: Option<u64>
-    ) -> Result<ValueJoinHandle<Self>, Code> {
+    ) -> Result<ValueJoinHandle<Self, ()>, Code> {
         let (op_queue_tx, op_queue_rx) = mpsc::channel::<ContextThunk>(
             OP_QUEUE_SIZE
         );
 
         Ok(ValueJoinHandle::new(
-            Self { op_queue: op_queue_tx },
+            Self(op_queue_tx),
             start_context_handler(
                 server,
                 max_mainloop_interval_usec,
@@ -142,111 +105,40 @@ impl PulseContextWrapper {
     /// Submits the given context operation to the background task.
     ///
     /// This function does not provide a return channel. If a result is needed
-    /// from the task, either use [`PulseContextWrapper::do_ctx_op`] and its
-    /// cohort, or manually implement the return channel in the submitted
-    /// operation.
-    pub async fn with_ctx<F: FnOnce(&mut Context) + Send + 'static>(&self, op: F) {
-        if self.op_queue.send(Box::new(op)).await.is_err() {
+    /// from the task, refer to [`PulseContextWrapper::with_ctx()`] for simple
+    /// cases. When a context task that produces an asynchronous [`Operation`],
+    /// use [`PulseContextWrapper::do_ctx_op`] and its cohort instead.
+    pub async fn submit<F>(&self, op: F)
+    where F: FnOnce(&mut Context) + Send + 'static {
+        if self.0.send(Box::new(op)).await.is_err() {
             panic!("PulseAudio context handler task unexpectedly terminated");
         }
     }
 
-    /// Opens a recording stream against the audio source with the given name,
-    /// at the requested volume, if any. Returns a consuming handle for the
-    /// stream and the underlying task performing the raw stream handling in a
-    /// [`ValueJoinHandle`].
-    pub async fn open_rec_stream(
-        &self,
-        source_name: impl ToString,
-        volume: Option<f64>
-    ) -> Result<ValueJoinHandle<SampleConsumer>, Code> {
-        let mut stream = self.get_connected_stream(source_name.to_string()).await?;
-        let (mut sample_tx, sample_rx) = AsyncRb::<u8, HeapRb<u8>>::new(SAMPLE_QUEUE_SIZE).split();
+    /// Runs and awaits the submitted context operation, returning its result.
+    ///
+    /// If the operation works with context operations that return an
+    /// asynchronous [`Operation`] handle, use
+    /// [`PulseContextWrapper::do_ctx_op`] and its cohort instead.
+    pub async fn with_ctx<F, T: Send + 'static>(&self, op: F) -> T
+    where F: FnOnce(&mut Context) -> T + Send + 'static {
+        let (tx, rx) = oneshot::channel::<T>();
 
-        if let Some(volume) = volume {
-            AsyncIntrospector::from(self).set_source_output_volume(
-                stream.get_index().unwrap(),
-                volume
-            ).await?
-        }
-
-        //Create a handle to the context queue, to force the mainloop to stay
-        //open while we're still processing samples
-        let self_handle = self.clone();
-
-        Ok(ValueJoinHandle::new(sample_rx, task::spawn_local(async move {
-            let notify = StreamReadNotifier::new(&mut stream);
-
-            while should_continue_stream_read(&sample_tx, &notify).await {
-                match stream.peek() {
-                    Ok(PeekResult::Data(samples)) => {
-                        if sample_tx.push_iter(samples.iter().map(|x| *x)).await.is_err() {
-                            //If this happens, we can break the loop immediately,
-                            //since we know the receiver dropped.
-                            debug!("Sample receiver dropped while transmitting samples");
-                            break;
-                        }
-                        if let Err(e) = stream.discard() {
-                            warn!("Failure to discard stream sample: {}", e);
-                        }
-                    },
-                    Ok(PeekResult::Hole(hole_size)) => {
-                        warn!("PulseAudio stream returned hole of size {} bytes", hole_size);
-                        if let Err(e) = stream.discard() {
-                            warn!( "Failure to discard stream sample: {}", e);
-                        }
-                    },
-                    Ok(PeekResult::Empty) => {
-                        trace!("PulseAudio stream had no data");
-                    },
-                    Err(e) => error!(
-                        "Failed to read audio from PulseAudio: {}",
-                        e
-                    ),
-                }
-            }
-
-            debug!("Stream handler shutting down");
-            notify.close(&mut stream);
-
-            //Tear down the record stream
-            if let Err(e) = stream.disconnect() {
-                if let Some(msg) = e.to_string() {
-                    warn!("Record stream failed to disconnect: {}", msg);
-                } else {
-                    warn!("Record stream failed to disconnect (code {})", e.0);
-                }
-            }
-            mem::drop(self_handle);
-
-            debug!("Stream handler shut down");
-        })))
-    }
-
-    /// Creates and returns a new recording stream against the source with the
-    /// given name.
-    async fn get_connected_stream(
-        &self,
-        source_name: String
-    ) -> Result<Stream, Code> {
-        let (tx, rx) = oneshot::channel();
-
-        self.with_ctx(move |ctx| {
-            if tx.send(create_and_connect_stream(ctx, &source_name)).is_err() {
-                panic!("Stream receiver unexpectedly terminated");
+        self.submit(move |ctx| {
+            if tx.send(op(ctx)).is_err() {
+                panic!("Context task result receiver unexpectedly dropped");
             }
         }).await;
 
-        // Note: stream_fut makes PulseAudio API calls directly, so we need
-        // to await it in a local task.
-        let stream_fut = rx.await.map_err(|_| Code::NoData)??;
-        task::spawn_local(stream_fut).await
-            .map_err(|_| Code::Killed)?
-            .map_err(|state| if state == StreamState::Terminated {
-                Code::Killed
-            } else {
-                Code::BadState
-            })
+        rx.await.expect("Context task unexpectedly dropped without returning")
+    }
+
+    /// Spawns a task to execute the given future on the context thread.
+    pub async fn spawn<T: Send + 'static>(
+        &self,
+        fut: impl Future<Output = T> + Send + 'static
+    ) -> JoinHandle<T> {
+        self.with_ctx(move |_| task::spawn_local(fut)).await
     }
 
     /// Core implementation of the [`PulseWrapper::do_ctx_op`] family of
@@ -259,71 +151,17 @@ impl PulseContextWrapper {
     where
         T: Send + 'static,
         S: ?Sized + 'static,
-        F: FnOnce(&mut Context, Weak<Mutex<T>>) -> Operation<S> + Send + 'static {
-        let (tx, rx) = oneshot::channel::<Result<T, OperationState>>();
-
-        self.with_ctx(move |ctx| {
-            let value = Arc::new(Mutex::new(initial_value));
-            let op = Arc::new(Mutex::new(Some(op(ctx, Arc::downgrade(&value)))));
-
-            let mut op_ref = Arc::clone(&op);
-            let mut tx = Some(tx);
-            let mut result = Some(value);
-
-            op.lock().unwrap().as_mut().unwrap().set_state_callback(Some(Box::new(move || {
-                let state = op_ref.lock().unwrap().as_ref().map(
-                    Operation::get_state
-                );
-
-                match state {
-                    Some(OperationState::Done) => {
-                        // There should never be any other strong references to
-                        // the value when this runs, so just try to unwrap it 
-                        if let Some(result) = mem::take(&mut result).map(Arc::into_inner).flatten() {
-                            let result = result.into_inner().unwrap();
-
-                            if util::opt_oneshot_try_send(&mut tx, Ok(result)).is_err() {
-                                warn!("Failed to report operation result, receiver dropped");
-                            }
-                        } else {
-                            warn!("Could not acquire context result");
-                            
-                            if util::opt_oneshot_try_send(
-                                &mut tx,
-                                Err(OperationState::Done)
-                            ).is_err() {
-                                warn!("Failed to report operation result, receiver dropped");
-                            }
-                        }
-                    },
-                    Some(OperationState::Cancelled) | None => {
-                        if state.is_none() {
-                            warn!("Operation handle dropped during callback execution");
-                        }
-
-                        if util::opt_oneshot_try_send(
-                            &mut tx,
-                            Err(OperationState::Cancelled)
-                        ).is_err() {
-                            warn!("Failed to report operation result, receiver dropped");
-                        }
-                    }
-                    Some(state) => debug!(
-                        "Context handler ignoring state change to {:?}",
-                        state
-                    ),
-                }
-
-                if tx.is_none() {
-                    mem::drop(mem::take(&mut op_ref));
-                }
-            })));
-        }).await;
-
-        //this returns Result<Result<T, OperationState>, RecvError>. If the
-        //outer Result returns an Err, then the sender was dropped before it
-        //sent any value, so we treat this as a cancelled state.
-        rx.await.map_err(|_| OperationState::Cancelled)?
+        F: FnOnce(&mut Context, Weak<Mutex<T>>) -> Operation<S> + Send + 'static
+    {
+        // If the OneshotSender returned by operation_to_future returns an
+        // error, then sender associated with the operation object was dropped
+        // before it sent any value, which we can treat as a cancelled state.
+        self.with_ctx(|ctx| {
+            async_polyfill::operation_to_future(
+                initial_value,
+                move |result| op(ctx, result)
+            )
+        }).await.await.map_err(|_| OperationState::Cancelled)?
     }
 
     /// Executes the given function `op`, and waits for the returned
@@ -485,36 +323,10 @@ impl MainloopHandler {
     }
 
     /// Launches a dedicated task to execute the mainloop.
-    fn start(mut self) -> MainloopHandle {
-        let (tx, rx) = oneshot::channel();
-
-        MainloopHandle(tx, task::spawn_local(async move {
+    fn start(mut self) -> ControlledJoinHandle<()> {
+        ControlledJoinHandle::from(|rx| task::spawn_local(async move {
             self.mainloop(rx).await;
         }))
-    }
-}
-
-impl MainloopHandle {
-    /// Awaits a potential termination of the mainloop task without consuming
-    /// the handle, to allow cancellations and reuse.
-    async fn await_termination(&mut self) -> Result<(), JoinError> {
-        (&mut self.1).await
-    }
-
-    /// Sends a shutdown signal to the mainloop task and waits for it to
-    /// terminate.
-    async fn stop(self) {
-        if self.0.send(()).is_err() {
-            warn!("Failed to terminated mainloop, it may already have exited");
-        }
-
-        if !self.1.is_finished() {
-            if let Err(e) = self.1.await {
-                if e.is_panic() {
-                    warn!("Mainloop task panicked upon shutdown");
-                }
-            }
-        }
     }
 }
 
@@ -528,7 +340,7 @@ impl MainloopHandle {
 fn pulse_init(
     server: Option<&str>,
     max_mainloop_interval_usec: Option<u64>
-) -> Result<(MainloopHandle, InitializingFuture<ContextState, Context>), Code> {
+) -> Result<(ControlledJoinHandle<()>, InitializingFuture<ContextState, Context>), Code> {
     let mainloop = Mainloop::new().ok_or(Code::BadState)?;
     let mut ctx = Context::new(
         &mainloop,
@@ -563,6 +375,16 @@ fn pulse_init(
     ))
 }
 
+/// Helper function to stop the running mainloop task. Logs a warning if the
+/// mainloop task panics.
+async fn stop_mainloop(mainloop_handle: ControlledJoinHandle<()>) {
+    if let Err(e) = mainloop_handle.join().await {
+        if e.is_panic() {
+            warn!("Mainloop task panicked on shutdown");
+        }
+    }
+}
+
 /// Initializes a PulseAudio [`Context`] and spawns a local task to receive and
 /// execute context operations from the given `op_queue`.
 async fn start_context_handler(
@@ -584,7 +406,7 @@ async fn start_context_handler(
                     trace!("Context handler awaiting next job");
                     tokio::select! {
                         biased;
-                        _ = mainloop_handle.await_termination() => panic!("Mainloop terminated unexpectedly"),
+                        _ = mainloop_handle.await_completion() => panic!("Mainloop terminated unexpectedly"),
                         op = op_queue.recv() => if let Some(op) = op {
                             op(&mut ctx);
                         } else {
@@ -596,67 +418,18 @@ async fn start_context_handler(
 
                 debug!("Context handler shutting down");
                 ctx.disconnect();
-                mainloop_handle.stop().await;
+                stop_mainloop(mainloop_handle).await;
                 debug!("Context handler shut down");
             }))
         },
         Err(state) => {
             error!("PulseAudio context failed to connect");
-
-            mainloop_handle.stop().await;
+            stop_mainloop(mainloop_handle).await;
             Err(if state == ContextState::Terminated {
                 Code::ConnectionTerminated
             } else {
                 Code::Unknown
             })
         }
-    }
-}
-
-/// Creates a recording stream against the named audio source, returning it
-/// as an [`InitializingFuture`] that resolves once the stream enters the ready
-/// state.
-fn create_and_connect_stream(
-    ctx: &mut Context,
-    source_name: impl AsRef<str>
-) -> Result<InitializingFuture<StreamState, Stream>, Code> {
-    //Technically init_stereo should create a new channel map with the format
-    //specifier "front-left,front-right", but due to oddities in the Rust
-    //binding for PulseAudio, we have to manually specify the format first. We
-    //call init_stereo anyways to make sure we are always using the server's
-    //understanding of stereo audio.
-    let mut channel_map = ChannelMap::new_from_string("front-left,front-right")
-        .map_err(|_| Code::Invalid)?;
-    channel_map.init_stereo();
-
-    let mut stream = Stream::new(
-        ctx,
-        "capture stream",
-        &SAMPLE_SPEC,
-        Some(&channel_map)
-    ).expect("Failed to open record stream");
-
-    stream.connect_record(
-        Some(source_name.as_ref()),
-        None,
-        StreamFlagSet::START_UNMUTED
-    ).map_err(|pa_err| Code::try_from(pa_err).unwrap_or(Code::Unknown))?;
-
-    Ok(InitializingFuture::from(stream))
-}
-
-/// Determines if the stream handler should continue reading samples, or exit.
-///
-/// This also waits for data to appear in the underlying stream, to prevent
-/// needless iterating over a stream with no data.
-async fn should_continue_stream_read(
-    sample_tx: &AsyncProducer<u8, Arc<AsyncRb<u8, HeapRb<u8>>>>,
-    notify: &StreamReadNotifier
-) -> bool {
-    if sample_tx.is_closed() {
-        false
-    } else {
-        notify.await_data().await;
-        true
     }
 }

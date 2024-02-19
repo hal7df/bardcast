@@ -234,8 +234,15 @@ async fn set_subscribe_callback(ctx_wrap: &PulseContextWrapper) -> RawEventConsu
         NOTIFY_QUEUE_LENGTH
     ).split();
 
-    ctx_wrap.with_ctx(move |ctx| {
+    ctx_wrap.submit(move |ctx| {
         ctx.set_subscribe_callback(Some(Box::new(move |facility, change, index| {
+            debug!(
+                "Received event from server: facility: {:?}, index: {:?}, change: {:?}",
+                facility,
+                index,
+                change
+            );
+
             let change_event = RawChangeEvent::try_new(facility, change, index);
 
             if let Ok(change_event) = change_event {

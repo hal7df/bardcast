@@ -14,6 +14,7 @@ pulse = ["dep:libpulse-binding", "dep:itertools"]
 wav = ["dep:wave_stream"]
 
 [dependencies]
+async-io = "2.3.1"
 async-ringbuf = "0.1.2"
 async-trait = "0.1.60"
 byteorder = "1.4.3"

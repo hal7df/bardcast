@@ -7,11 +7,21 @@ use std::future::Future;
 use std::marker::{PhantomData, Unpin};
 use std::mem;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::rc::Rc;
+use std::sync::{Arc, Mutex, Weak};
 use std::task::{Context, Poll, Waker};
 
+use log::{debug, warn};
+use tokio::sync::oneshot::{self, Receiver as OneshotReceiver};
+
 use libpulse::context::{Context as PulseContext, State as PulseContextState};
+use libpulse::operation::{
+    Operation as PulseOperation,
+    State as PulseOperationState
+};
 use libpulse::stream::{Stream as PulseStream, State as PulseStreamState};
+
+use crate::util;
 
 //TYPE DEFINITIONS *************************************************************
 
@@ -47,7 +57,7 @@ pub trait InitializingEntity<S> {
 /// [`Result`].
 pub struct InitializingFuture<S, T: InitializingEntity<S>>(
     Option<T>,
-    PhantomData<S>
+    PhantomData<Rc<S>>, //satisfies the S generic, impls !Send + !Sync
 );
 
 /// Helper for asynchronously determining when a recording audio stream has new
@@ -219,4 +229,78 @@ impl<'a> Drop for StreamReadFuture<'a> {
         //nonexistent task
         *self.waker.lock().unwrap() = None;
     }
+}
+
+// PUBLIC UTILITY FUNCTIONS ****************************************************
+/// Helper function for converting PulseAudio's C-style asynchronous operations
+/// that use the `Operation` type into Rust-compatible `Future`s.
+///
+/// A default/initial value for the result of the future is required, which will
+/// be returned if the `Operation` changes to the `Done` state without returning
+/// any data.
+pub fn operation_to_future<T, S, F>(
+    initial_value: T,
+    op: F
+) -> OneshotReceiver<Result<T, PulseOperationState>>
+where
+    T: 'static,
+    S: ?Sized + 'static,
+    F: FnOnce(Weak<Mutex<T>>) -> PulseOperation<S>
+{
+    let (tx, rx) = oneshot::channel::<Result<T, PulseOperationState>>();
+    let value = Arc::new(Mutex::new(initial_value));
+    let op = Arc::new(Mutex::new(Some(op(Arc::downgrade(&value)))));
+
+    let mut op_ref = Arc::clone(&op);
+    let mut tx = Some(tx);
+    let mut result = Some(value);
+
+    op.lock().unwrap().as_mut().unwrap().set_state_callback(Some(Box::new(move || {
+        let state = op_ref.lock().unwrap().as_ref().map(PulseOperation::get_state);
+
+        match state {
+            Some(PulseOperationState::Done) => {
+                // There should never be any other strong references to the
+                // value when this runs, so just try to unwrap it
+                if let Some(result) = mem::take(&mut result).map(Arc::into_inner).flatten() {
+                    let result = result.into_inner().unwrap();
+
+                    if util::opt_oneshot_try_send(&mut tx, Ok(result)).is_err() {
+                        warn!("Failed to report operation result, receiver dropped");
+                    }
+                } else {
+                    warn!("Could not acquire context result");
+
+                    if util::opt_oneshot_try_send(
+                        &mut tx,
+                        Err(PulseOperationState::Done)
+                    ).is_err() {
+                        warn!("Failed to report operation result, receiver dropped");
+                    }
+                }
+            },
+            Some(PulseOperationState::Cancelled) | None => {
+                if state.is_none() {
+                    warn!("Operation handle dropped during callback execution");
+                }
+
+                if util::opt_oneshot_try_send(
+                    &mut tx,
+                    Err(PulseOperationState::Cancelled)
+                ).is_err() {
+                    warn!("Failed to report operation result, receiver dropped");
+                }
+            },
+            Some(state) => debug!(
+                "Pulse operation handler ignoring state change to {:?}",
+                state
+            ),
+        }
+
+        if tx.is_none() {
+            mem::drop(mem::take(&mut op_ref));
+        }
+    })));
+
+    rx
 }

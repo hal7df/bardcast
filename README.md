@@ -111,6 +111,7 @@ General top-level application configuration.
 | ------ | ---- | ----------- |
 | `log-level` | `off`, `error`, `warn`, `info`, `debug`, `trace` | Specifies the level of verbosity produced by the application. Defaults to `info`. |
 | `driver` | `pulse` | The name of the sound driver to use. Some drivers may be unavailable, depending on your OS. |
+| `stream-timeout-ms` | u64 | The number of elapsed milliseconds between audio chunks before bardcast considers the stream stale and stops sending audio. Defaults to 250. |
 | `threads` | usize | The number of worker threads to spin up for the application. This does not include the application main thread or threads spun up internally by libraries. Defaults to 2. |
 
 ### Section: discord
@@ -129,6 +130,7 @@ available on Unix systems when built with the `pulse` feature flag.
 
 | Option | Type | Description |
 | ------ | ---- | ----------- |
+| `intercept-limit` | usize | A limit to the number of streams that bardcast intercepts concurrently. No limit will be applied if not set. |
 | `intercept-mode` | `capture`, `monitor` | The audio intercept mode that the driver should use. Defaults to `capture`. |
 | `stream-regex` | Regular expression | A regular expression that matches against applications that you want to intercept. |
 | `stream-properties` | Comma-separated list | A list of PulseAudio property names to match `stream-regex` against. |

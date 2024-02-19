@@ -4,6 +4,7 @@
 use std::collections::HashSet;
 use std::mem;
 use std::path::Path;
+use std::time::Duration;
 
 use clap::{crate_name, Parser, ValueEnum};
 use configparser::ini::Ini;
@@ -113,6 +114,12 @@ pub struct Args {
     /// Defaults to 2.
     #[clap(short = 'j', long)]
     pub threads: Option<usize>,
+
+    /// Number of appliations that can be captured concurrently.
+    ///
+    /// Ignored if -E/--stream-regex is not set
+    #[clap(short = 'n', long)]
+    pub intercept_limit: Option<usize>,
 
     /// Application verbosity level. One of "off", "error", "warn", "info",
     /// "debug", or "trace". If not specified, this will default to "info".
@@ -230,6 +237,10 @@ pub struct ApplicationConfig {
     #[cfg(feature = "wav")]
     pub output_file: Option<String>,
 
+    /// A timeout, in milliseconds, used to determine when an audio stream has
+    /// become stale.
+    pub stream_timeout: Option<Duration>,
+
     /// The number of threads to use in the application runtime.
     pub threads: Option<usize>,
 }
@@ -264,6 +275,7 @@ impl TryFrom<Args> for ApplicationConfig {
             driver_name: args.driver_name,
             #[cfg(feature = "wav")]
             output_file: args.output_file,
+            stream_timeout: None,
             threads: args.threads,
         })
     }
@@ -295,6 +307,7 @@ impl ApplicationConfig {
             driver_name: config.get(crate_name!(), "driver"),
             #[cfg(feature = "wav")]
             output_file: config.get("wav", "output-file"),
+            stream_timeout: validate_stream_timeout(&config.getuint(crate_name!(), "stream-timeout-ms"))?,
             threads: validate_thread_count(&config.getuint(crate_name!(), "threads")?)?,
         })
     }
@@ -310,6 +323,7 @@ impl ApplicationConfig {
         merge_opt(&mut self.driver_name, other.driver_name);
         #[cfg(feature = "wav")]
         merge_opt(&mut self.output_file, other.output_file);
+        merge_opt(&mut self.stream_timeout, other.stream_timeout);
         merge_opt(&mut self.threads, other.threads);
     }
 
@@ -325,14 +339,18 @@ impl ApplicationConfig {
     /// This will only be called after all config merges are complete.
     pub fn validate_semantics(&self, action: Action) -> Result<(), String> {
         if let Action::Run(consumer) = action {
-            if self.output_file.is_some() && !consumer.needs_output_file() {
-                //This function may be called before the logging system is
-                //initialized, so use eprintln directly instead.
-                eprintln!("-o/--output-file does not make sense with the selected audio consumer, ignoring");
-            } else if self.output_file.is_none() && consumer.needs_output_file() {
-                return Err(String::from("Selected audio consumer requires an output file to be specified"));
+            #[cfg(feature = "wav")]
+            {
+                if self.output_file.is_some() && !consumer.needs_output_file() {
+                    //This function may be called before the logging system is
+                    //initialized, so use eprintln directly instead.
+                    eprintln!("-o/--output-file does not make sense with the selected audio consumer, ignoring");
+                } else if self.output_file.is_none() && consumer.needs_output_file() {
+                    return Err(String::from("Selected audio consumer requires an output file to be specified"));
+                }
             }
 
+            #[cfg(all(target_family = "unix", feature = "pulse"))]
             self.pulse.validate_semantics(action)?;
             self.discord.validate_semantics(action)
         } else if action == Action::ListServers {
@@ -405,6 +423,14 @@ fn validate_log_level(raw_level: &Option<String>) -> Result<Option<LevelFilter>,
     raw_level.as_ref().map(|l| {
         level_filter_from_string(l).ok_or(String::from("Unknown log level"))
     }).transpose()
+}
+
+/// Converts the given millisecond stream timeout into a [`Duration`] instance,
+/// returning a validation error if not otherwise possible.
+fn validate_stream_timeout(raw_timeout: &Result<Option<u64>, String>) -> Result<Option<Duration>, String> {
+    raw_timeout.as_ref().map(|timeout| timeout.map(
+            |timeout_ms| Duration::from_millis(timeout_ms)
+    )).map_err(|s| format!("stream-timeout-ms: Not a valid timeout: {}", s))
 }
 
 /// Validates that a `u64` can be contained in a `usize`, and returns a

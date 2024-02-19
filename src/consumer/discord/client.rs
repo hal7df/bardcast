@@ -3,12 +3,17 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use clap::{crate_name, crate_version};
 use dashmap::DashMap;
-use log::{debug, info};
+use log::{debug, info, warn};
+use serenity::CacheAndHttp;
 use serenity::client::{Client, Context, EventHandler};
+use serenity::http::CacheHttp;
+use serenity::http::client::Http;
 use serenity::model::channel::{ChannelType, GuildChannel};
 use serenity::model::gateway::{GatewayIntents, Ready};
 use serenity::model::id::{ChannelId, GuildId};
+use serenity::utils::MessageBuilder;
 use serenity::prelude::{SerenityError, TypeMapKey};
 use songbird::Songbird;
 use songbird::serenity::SerenityInit;
@@ -57,6 +62,57 @@ pub struct ChannelResolutionReceiver;
 /// to events from Discord. However, the implementation is used for one thing:
 /// resolving channel names to channel IDs, prior to the application connecting.
 struct Handler;
+
+// TYPE IMPLS ******************************************************************
+impl Channels<ChannelId> {
+    /// Posts a "hello"/on-connect message to the configured metadata channel,
+    /// if any.
+    pub async fn hello(&self, cache_http: &CacheAndHttp) {
+        if let Some(metadata_channel) = self.metadata {
+            match self.voice.to_channel(cache_http).await {
+                Ok(voice_channel) => {
+                    let msg = MessageBuilder::new()
+                        .push(format!(
+                            "{} version {} connected to voice channel ",
+                            crate_name!(),
+                            crate_version!()
+                        ))
+                        .mention(&voice_channel)
+                        .build();
+
+                    if let Err(e) = metadata_channel.say(
+                        cache_http.http(),
+                        msg
+                    ).await {
+                        warn!(
+                            "Failed to post initialization message to Discord: {}",
+                            e
+                        );
+                    }
+                },
+                Err(e) => warn!(
+                    "Failed to post initialization message to Discord due to \
+                     failure to look up voice channel metadata: {}",
+                    e
+                ),
+            }
+        }
+    }
+
+
+    /// Posts a "goodbye"/on-disconnect message to the configured metadata
+    /// channel.
+    pub async fn goodbye(&self, http: &Http) {
+        if let Some(metadata_channel) = self.metadata {
+            if let Err(e) = metadata_channel.say(
+                http,
+                format!("{} disconnected", crate_name!())
+            ).await {
+                warn!("Failed to post disconnect message to Discord: {}", e);
+            }
+        }
+    }
+}
 
 // TRAIT IMPLS *****************************************************************
 impl TryFrom<&DiscordConfig> for Channels<String> {

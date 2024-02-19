@@ -17,12 +17,12 @@ use tokio::sync::watch::{self, Sender};
 use tokio::task::{JoinError, LocalSet};
 
 use self::cfg::{Action, Args, ApplicationConfig, SelectedConsumer};
-use self::consumer::discord;
+use self::consumer::discord::{self, DiscordConsumer};
 use self::util::fmt as fmt_util;
-use self::util::task::{TaskContainer, TaskSetBuilder};
+use self::util::task::{TaskContainer, TaskSet};
 
 #[cfg(feature = "wav")]
-use self::consumer::wav;
+use self::consumer::wav::WavConsumer;
 
 const DEFAULT_WORKER_THREADS: usize = 2;
 
@@ -195,60 +195,33 @@ fn start(
         //Step 1: Start up the audio driver
         debug!("Starting audio driver");
         let local = LocalSet::new();
-        let driver = local.run_until(snd::select_and_start_driver(&config, shutdown_rx.clone())).await;
-
-        match driver {
-            Ok(driver) => {
-                let (stream, driver_tasks) = driver.into_tuple();
-                let stream_tasks: Result<Box<dyn TaskContainer<()>>, String> = match consumer {
-                    SelectedConsumer::Discord => {
-                        let mut tasks = TaskSetBuilder::new();
-                        let send_audio_result = discord::send_audio(
-                            stream,
-                            &config.discord,
-                            shutdown_rx
-                        ).await;
-
-                        match send_audio_result {
-                            Ok(task) => {
-                                tasks.insert(task);
-                                Ok(Box::new(tasks.build()))
-                            },
-                            Err(e) => Err(e.to_string()),
-                        }
-                    },
-                    #[cfg(feature = "wav")]
-                    SelectedConsumer::Wav => {
-                        if let Some(output_file) = &config.output_file {
-                            let mut tasks = TaskSetBuilder::new();
-                            let record_result = wav::record(
-                                output_file,
-                                stream.into_media_source(),
-                                shutdown_rx
-                            );
-
-                            match record_result {
-                                Ok(task) => {
-                                    tasks.insert(task);
-                                    Ok(Box::new(tasks.build()))
-                                },
-                                Err(e) => Err(e.to_string()),
-                            }
-                        } else {
-                            Err(String::from("Wav consumer requires -o/--output-file"))
-                        }
-                    },
-                };
-
-                application_monitor(
-                    driver_tasks,
-                    stream_tasks?,
-                    shutdown_tx,
-                    local
-                ).await
+        let tasks = match consumer {
+            SelectedConsumer::Discord => {
+                local.run_until(snd::select_and_start_driver(
+                    &config,
+                    DiscordConsumer::new(&config.discord, config.stream_timeout),
+                    shutdown_rx.clone()
+                )).await.map_err(|e| e.to_string())
             },
-            Err(e) => Err(e.to_string()),
-        }
+            #[cfg(feature = "wav")]
+            SelectedConsumer::Wav => {
+                if let Some(output_file) = &config.output_file {
+                    local.run_until(snd::select_and_start_driver(
+                        &config,
+                        WavConsumer::new(output_file, config.stream_timeout),
+                        shutdown_rx.clone()
+                    )).await.map_err(|e| e.to_string())
+                } else {
+                    Err(String::from("Wav consumer requires -o/--output-file"))
+                }
+            }
+        }?;
+
+        application_monitor(
+            tasks,
+            local,
+            shutdown_tx
+        ).await
     })
 }
 
@@ -256,10 +229,9 @@ fn start(
 /// conditions are met (either on SIGINT or when a monitored task panics). Also
 /// advances tasks in the given [`LocalSet`], if any.
 async fn application_monitor(
-    mut driver_tasks: Box<dyn TaskContainer<()>>,
-    mut stream_tasks: Box<dyn TaskContainer<()>>,
-    shutdown_tx: Sender<bool>,
-    local: LocalSet
+    mut tasks: TaskSet<()>,
+    local: LocalSet,
+    shutdown_tx: Sender<bool>
 ) -> Result<(), String> {
     //Step 2: Listen for interrupts
     debug!("Setting up signal handler");
@@ -271,7 +243,7 @@ async fn application_monitor(
     let mut interrupt_read = false;
     let mut shutdown_result: Result<(), String> = Ok(());
 
-    while !(driver_tasks.is_empty() && stream_tasks.is_empty()) {
+    while !tasks.is_empty() {
         tokio::select! {
             biased;
             interrupted = &mut interrupt, if !interrupt_read => {
@@ -288,11 +260,7 @@ async fn application_monitor(
                     info!("Received interrupt, tearing down...");
                 }
             },
-            driver_task = driver_tasks.join_next(), if !driver_tasks.is_empty() => if let Err(e) = handle_task_complete(driver_task) {
-                shutdown_result = Err(e);
-                shutdown_tx.send(false).expect("Failed to initiate graceful shutdown");
-            },
-            stream_task = stream_tasks.join_next(), if !stream_tasks.is_empty() => if let Err(e) = handle_task_complete(stream_task) {
+            task = tasks.join_next(), if !tasks.is_empty() => if let Err(e) = handle_task_complete(task) {
                 shutdown_result = Err(e);
                 shutdown_tx.send(false).expect("Failed to initiate graceful shutdown");
             },
