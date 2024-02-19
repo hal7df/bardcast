@@ -545,6 +545,7 @@ async fn do_stream(
                     let ret_result = tx.send(match cork_state {
                         Ok(cork_state) => if cork != cork_state {
                             let op_result = if cork {
+                                info!("Corking record stream");
                                 async_polyfill::operation_to_future(
                                     false,
                                     |result| {
@@ -554,6 +555,7 @@ async fn do_stream(
                                     }
                                 ).await
                             } else {
+                                info!("Uncorking record stream");
                                 async_polyfill::operation_to_future(
                                     false,
                                     |result| {
