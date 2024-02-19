@@ -217,6 +217,13 @@ impl DuplexingInterceptor {
         volume: Option<f64>,
         limit: Option<usize>
     ) -> Result<(Self, SampleConsumer), Code> {
+        warn!(
+            "There may be significant latency (1-5s) when intercepting \
+             multiple applications with monitor mode. For lower latency, \
+             consider using capture mode, or setting an intercept limit of 1 \
+             using -n/--intercept-limit."
+        );
+
         let introspect = AsyncIntrospector::from(ctx);
         let rec = util::create_rec_sink(&introspect).await?;
         debug!("Created rec sink at index {}", rec.index);
