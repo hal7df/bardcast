@@ -3,6 +3,7 @@
 extern crate libpulse_binding as libpulse;
 
 use std::fmt::{Display, Error as FormatError, Formatter};
+use std::mem;
 use std::panic;
 use std::sync::Arc;
 
@@ -18,6 +19,7 @@ use tokio::task::{self, JoinHandle};
 
 use libpulse::channelmap::Map as ChannelMap;
 use libpulse::context::Context;
+use libpulse::def::BufferAttr;
 use libpulse::error::Code;
 use libpulse::sample::{Format as SampleFormat, Spec as SampleSpec};
 use libpulse::stream::{
@@ -26,6 +28,7 @@ use libpulse::stream::{
     State,
     Stream
 };
+use libpulse::time::MicroSeconds;
 
 use crate::util::{Lease, Lessor};
 use super::super::owned::{OwnedSinkInfo, OwnedSinkInputInfo, OwnedSourceInfo};
@@ -39,8 +42,9 @@ use super::collect::CollectResult;
 /// 48 kHz.
 const SAMPLE_RATE: u32 = 48000;
 
-/// The size of the sample buffer in bytes.
-const SAMPLE_QUEUE_SIZE: usize = SAMPLE_RATE as usize * 2;
+/// The size of the sample buffer in bytes. Sufficient to buffer 10ms of audio
+/// data.
+const SAMPLE_QUEUE_SIZE: usize = SAMPLE_RATE as usize * 2 * mem::size_of::<f32>() * 10 / 1000;
 
 /// PulseAudio [`SampleSpec`] definition matching the requirements of the driver
 /// specification.
@@ -49,6 +53,14 @@ const SAMPLE_SPEC: SampleSpec = SampleSpec {
     channels: 2,
     rate: SAMPLE_RATE,
 };
+
+/// Maximum desired PulseAudio stream latency.
+const MAX_STREAM_LATENCY: MicroSeconds =
+    MicroSeconds(20 * MicroSeconds::MILLISECOND.0);
+
+/// The standard set of stream flags used when opening an audio stream.
+const STREAM_FLAGS: FlagSet =
+    FlagSet::START_UNMUTED.union(FlagSet::ADJUST_LATENCY);
 
 /// The maximum number of consecutive non-fatal stream read errors that are
 /// allowed before the stream task automatically terminates.
@@ -397,8 +409,8 @@ impl StreamConfig for OwnedSinkInfo {
         if let Some(source_name) = self.monitor_source_name.as_ref() {
            stream.connect_record(
                Some(&source_name),
-               None,
-               FlagSet::START_UNMUTED
+               Some(&get_buf_attrs()),
+               STREAM_FLAGS
             ).map_err(|pa_err| Code::try_from(pa_err).unwrap_or(Code::Unknown))?;
 
            Ok(stream)
@@ -413,8 +425,8 @@ impl StreamConfig for OwnedSourceInfo {
         if let Some(name) = self.name.as_ref() {
             stream.connect_record(
                 Some(&name),
-                None,
-                FlagSet::START_UNMUTED
+                Some(&get_buf_attrs()),
+                STREAM_FLAGS
             ).map_err(|pa_err| Code::try_from(pa_err).unwrap_or(Code::Unknown))?;
 
             Ok(stream)
@@ -470,6 +482,16 @@ impl Drop for StreamManager {
 }
 
 // HELPER FUNCTIONS ************************************************************
+fn get_buf_attrs() -> BufferAttr {
+    BufferAttr {
+        maxlength: u32::MAX,
+        tlength: u32::MAX,
+        prebuf: u32::MAX,
+        minreq: u32::MAX,
+        fragsize: SAMPLE_SPEC.usec_to_bytes(MAX_STREAM_LATENCY) as u32,
+    }
+}
+
 /// Core implementation for recording audio from a `Stream`.
 ///
 /// Data will be read into `sample_tx`.
@@ -619,7 +641,7 @@ async fn do_stream(
                 },
                 StreamWriteResult::DataWritten | StreamWriteResult::NoOp => {
                     err_count = 0;
-                }
+                },
             },
         }
     }
