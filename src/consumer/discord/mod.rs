@@ -16,18 +16,15 @@ use async_trait::async_trait;
 use futures::future::{self, Either, FutureExt, TryFutureExt};
 use futures::stream::{self, Stream, TryStreamExt};
 use log::{error, info, warn};
-use serenity::CacheAndHttp;
 use serenity::http::{CacheHttp, GuildPagination, Http};
 use serenity::model::guild::{GuildInfo, PartialGuild};
 use serenity::model::id::{ChannelId, GuildId};
 use serenity::model::user::User;
 use serenity::prelude::SerenityError;
 use songbird::{Call, Songbird};
-use songbird::error::TrackError;
-use songbird::input::{Container, Input};
-use songbird::input::codec::Codec;
-use songbird::input::reader::{MediaSource, Reader};
-use songbird::tracks::TrackHandle;
+use songbird::input::{Input, RawAdapter};
+use songbird::input::core::io::MediaSource;
+use songbird::tracks::{ControlError, TrackHandle};
 use stream_flatten_iters::TryStreamExt as _;
 use tokio::sync::Mutex;
 use tokio::sync::oneshot::{self, Sender as OneshotSender};
@@ -47,6 +44,9 @@ const GUILD_ID_HEADER: &'static str = "Server ID";
 const GUILD_NAME_HEADER: &'static str = "Server Name";
 const OWNER_HEADER: &'static str = "Owner";
 const DEFAULT_FETCH_SIZE: u64 = 100;
+
+const STREAM_SAMPLE_RATE: u32 = 48000;
+const STREAM_CHANNELS: u32 = 2;
 
 // TYPE DEFINITIONS ************************************************************
 /// Discord [`AudioCosumer`] implementation.
@@ -81,7 +81,7 @@ struct ConnectedClient {
     call: Arc<Mutex<Call>>,
 
     /// A handle for making API calls to Discord.
-    cache_http: Arc<CacheAndHttp>,
+    http: Arc<Http>,
 }
 
 /// Adapter type for implementing MediaSource on existing Read types.
@@ -114,7 +114,7 @@ impl ConnectedClient {
             Some(channels),
             Some(songbird.clone())
         ).await?;
-        let cache_http = client.cache_and_http.clone();
+        let http = client.http.clone();
 
         //Step 2: Start the client and wait for the resolved channels
         let channel_rx = client.data
@@ -135,7 +135,7 @@ impl ConnectedClient {
 
             //Regardless of the result, we're shutting down, so terminate the
             //connection with Discord
-            client.shard_manager.lock().await.shutdown_all().await;
+            client.shard_manager.shutdown_all().await;
 
             shutdown_res
         });
@@ -154,20 +154,19 @@ impl ConnectedClient {
         };
 
         //Step 3: Connect to the voice channel
-        let (call, result) = songbird.join(channels.guild_id, channels.voice).await;
-
-        if let Err(e) = result {
-            client_task.abort();
-            return Err(e.into());
+        match songbird.join(channels.guild_id, channels.voice).await {
+            Ok(call) => Ok(Self {
+                channels,
+                client_task,
+                client_tx: Some(client_tx),
+                call,
+                http,
+            }),
+            Err(e) => {
+                client_task.abort();
+                Err(e.into())
+            },
         }
-
-        Ok(Self {
-            channels,
-            client_task,
-            client_tx: Some(client_tx),
-            call,
-            cache_http
-        })
     }
 
     /// Entry point for the main Discord client logic. Panics if the client
@@ -181,7 +180,7 @@ impl ConnectedClient {
         let mut playback: Option<TrackHandle> = None;
         let mut runtime_err: Result<(), DiscordError> = Ok(());
 
-        self.channels.hello(&self.cache_http).await;
+        self.channels.hello(&self.http).await;
 
         //Main consumer event loop
         while runtime_err.is_ok() {
@@ -236,7 +235,7 @@ impl ConnectedClient {
         }
 
         //Post a message that the application is disconnecting
-        self.channels.goodbye(self.cache_http.http()).await;
+        self.channels.goodbye(self.http.http()).await;
 
         //Shut down the client handler thread, if it is still running
         if let Some(client_tx) = mem::take(&mut self.client_tx) {
@@ -345,11 +344,11 @@ pub async fn list_guilds(token: impl AsRef<str>) -> Result<(), SerenityError> {
     let client = client::get(token, None, None).await?;
 
     // Fetch a list of basic metadata for all available servers
-    let http = &client.cache_and_http.http;
+    let http = &client.http;
     let guild_data = enumerate_guilds(http)
-        .and_then(|guild| http.get_guild(guild.id.0))
+        .and_then(|guild| http.get_guild(guild.id))
         .and_then(|guild| http
-            .get_user(guild.owner_id.0)
+            .get_user(guild.owner_id)
             .map_ok(move |owner| (guild, owner))
         )
         .try_collect::<Vec<(PartialGuild, User)>>().await?;
@@ -364,7 +363,7 @@ pub async fn list_guilds(token: impl AsRef<str>) -> Result<(), SerenityError> {
     let guild_id_width = cmp::max(
         GUILD_ID_HEADER.len(),
         fmt_util::max_display_length(
-            guild_data.iter().map(|guild_and_owner| guild_and_owner.0.id.0)
+            guild_data.iter().map(|guild_and_owner| guild_and_owner.0.id)
         )
     );
     let guild_name_width = cmp::max(
@@ -383,11 +382,12 @@ pub async fn list_guilds(token: impl AsRef<str>) -> Result<(), SerenityError> {
     );
     for (guild, owner) in guild_data {
         println!(
-            "{: <guild_id_width$}\t{: <guild_name_width$}\t{}#{:0>4}",
-            guild.id.0,
+            "{: <guild_id_width$}\t{: <guild_name_width$}\t{}",
+            guild.id.get(),
             guild.name,
-            owner.name,
             owner.discriminator
+                .map(|discriminator| format!("{}#{:0>4}", &owner.name, discriminator))
+                .unwrap_or(owner.name.clone())
         );
     }
 
@@ -408,7 +408,7 @@ fn enumerate_guilds<'a>(
             }
 
             let guilds = api.get_guilds(
-                Option::<GuildPagination>::from(state).as_ref(),
+                Option::<GuildPagination>::from(state),
                 Some(DEFAULT_FETCH_SIZE)
             ).await;
 
@@ -458,13 +458,11 @@ where S: Read + StreamNotifier + Send + Sync + 'static {
         stream_lease.await_samples().await;
 
         //Start playback
-        Some(call.lock().await.play_only_source(Input::new(
-            true,
-            Reader::Extension(Box::new(MediaSourceAdapter::from(stream_lease))),
-            Codec::FloatPcm,
-            Container::Raw,
-            None
-        )))
+        Some(call.lock().await.play_only_input(Input::from(RawAdapter::new(
+            MediaSourceAdapter::from(stream_lease),
+            STREAM_SAMPLE_RATE,
+            STREAM_CHANNELS
+        ))))
     } else {
         //Wait for playback to terminate naturally, and reclaim the stream
         stream.await_release().await;
@@ -475,7 +473,7 @@ where S: Read + StreamNotifier + Send + Sync + 'static {
                 Ok(state) => if !state.playing.is_done() {
                     stop_playback(playback);
                 },
-                Err(TrackError::Finished) => {},
+                Err(ControlError::Finished) => {},
                 Err(e) => error!(
                     "Encountered unexpected error when checking playback status: {}",
                     e
