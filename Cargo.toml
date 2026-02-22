@@ -28,7 +28,7 @@ log = "0.4.17"
 regex = "1.6.0"
 ringbuf = "0.3.2"
 simple_logger = { version = "4.0.0", features = ["timestamps","colored","stderr","threads"] }
-songbird = "~0.4"
+songbird = { version = "~0.5", features = [ "serenity", "rustls", "driver", "gateway", "tungstenite" ] }
 stream-flatten-iters = "0.2.0"
 time = { version = "0.3.17", features = ["local-offset"] }
 tokio = { version = "~1.38", features = ["full"] }
