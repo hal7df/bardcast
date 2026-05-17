@@ -179,7 +179,7 @@ impl EventHandler for Handler {
                         })).expect("Resolved channels failed to send");
                     } else {
                         tx.send(Err(DiscordError::DataLookupError(format!(
-                            "No such ovice channel with name '{}'",
+                            "No such voice channel with name '{}'",
                             unresolved_channels.voice
                         )))).expect("Channel resolution failure failed to send");
                     }
