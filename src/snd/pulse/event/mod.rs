@@ -34,6 +34,7 @@ pub use self::error::{
     EventListenerError,
     LookupError
 };
+#[allow(unused_imports)]
 pub use self::listen::{
     EventListener,
     FilterMapEventListener,

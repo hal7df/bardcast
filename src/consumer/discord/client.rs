@@ -1,15 +1,14 @@
 ///! Lower-level Serenity client types and logic.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use clap::{crate_name, crate_version};
-use dashmap::DashMap;
 use log::{debug, info, warn};
-use serenity::CacheAndHttp;
 use serenity::client::{Client, Context, EventHandler};
 use serenity::http::CacheHttp;
-use serenity::http::client::Http;
+use serenity::http::Http;
 use serenity::model::channel::{ChannelType, GuildChannel};
 use serenity::model::gateway::{GatewayIntents, Ready};
 use serenity::model::id::{ChannelId, GuildId};
@@ -67,9 +66,9 @@ struct Handler;
 impl Channels<ChannelId> {
     /// Posts a "hello"/on-connect message to the configured metadata channel,
     /// if any.
-    pub async fn hello(&self, cache_http: &CacheAndHttp) {
+    pub async fn hello(&self, cache_http: impl CacheHttp) {
         if let Some(metadata_channel) = self.metadata {
-            match self.voice.to_channel(cache_http).await {
+            match self.voice.to_channel(&cache_http).await {
                 Ok(voice_channel) => {
                     let msg = MessageBuilder::new()
                         .push(format!(
@@ -122,7 +121,7 @@ impl TryFrom<&DiscordConfig> for Channels<String> {
         if let Some(server_id) = cfg.server_id {
             if let Some(voice_channel) = &cfg.voice_channel {
                 Ok(Self {
-                    guild_id: GuildId(server_id),
+                    guild_id: GuildId::new(server_id),
                     voice: voice_channel.clone(),
                     metadata: cfg.metadata_channel.clone(),
                 })
@@ -151,38 +150,44 @@ impl EventHandler for Handler {
             let tx = data.remove::<ChannelResolutionSender>()
                 .expect("Discord channel resolution sender should be present");
 
-            if let Some(all_channels) = ctx.cache.guild_channels(
-                unresolved_channels.guild_id
-            ) {
-                let voice = find_matching_channel(
-                    &all_channels,
-                    &unresolved_channels.voice,
-                    ChannelType::Voice
-                );
-                let metadata = unresolved_channels.metadata.as_ref()
-                    .map(|name| find_matching_channel(
-                        &all_channels,
-                        &name,
-                        ChannelType::Text
-                    ))
-                    .flatten();
-
-                if let Some(voice) = voice {
-                    tx.send(Ok(Channels {
-                        guild_id: unresolved_channels.guild_id,
-                        voice,
-                        metadata,
-                    })).expect("Resolved channels failed to send");
-                } else {
-                    tx.send(Err(DiscordError::DataLookupError(format!(
-                        "No such voice channel with name '{}'",
-                        unresolved_channels.voice
-                    )))).expect("Channel resolution failure failed to send");
-                }
-            } else {
+            // Need to clone the guild object as the cache object is not Send
+            let Some(guild) = ctx.cache.guild(unresolved_channels.guild_id).map(|g| g.clone()) else {
                 tx.send(Err(DiscordError::DataLookupError(String::from(
-                    "Available channels unexpectedly missing from cache"
+                    "Could not find guild in cache"
                 )))).expect("Channel resolution failure failed to send");
+                return;
+            };
+
+            match guild.channels(&ctx.http).await {
+                Ok(all_channels) => {
+                    if let Some(voice) = find_matching_channel(
+                        &all_channels,
+                        &unresolved_channels.voice,
+                        ChannelType::Voice
+                    ) {
+                        let metadata = unresolved_channels.metadata.as_ref()
+                            .map(|name| find_matching_channel(
+                                &all_channels,
+                                &name,
+                                ChannelType::Text
+                            ))
+                            .flatten();
+                        tx.send(Ok(Channels {
+                            guild_id: unresolved_channels.guild_id,
+                            voice,
+                            metadata,
+                        })).expect("Resolved channels failed to send");
+                    } else {
+                        tx.send(Err(DiscordError::DataLookupError(format!(
+                            "No such voice channel with name '{}'",
+                            unresolved_channels.voice
+                        )))).expect("Channel resolution failure failed to send");
+                    }
+                },
+                Err(e) => {
+                    tx.send(Err(DiscordError::Serenity(e)))
+                        .expect("Channel resolution failure failed to send");
+                }
             }
         }
     }
@@ -240,15 +245,13 @@ pub async fn get(
 /// Helper function for finding a channel with a matching name and type from
 /// a connection of channels for a single guild.
 fn find_matching_channel(
-    channels: &DashMap<ChannelId, GuildChannel>,
+    channels: &HashMap<ChannelId, GuildChannel>,
     name: impl AsRef<str>,
     kind: ChannelType
 ) -> Option<ChannelId> {
     channels.iter().find_map(move |entry| {
-        let channel = entry.value();
-
-        if channel.name.as_str() == name.as_ref() && channel.kind == kind {
-            Some(entry.key().clone())
+        if entry.1.name.as_str() == name.as_ref() && entry.1.kind == kind {
+            Some(entry.0.clone())
         } else {
             None
         }

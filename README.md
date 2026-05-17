@@ -5,11 +5,6 @@ and stream it to a Discord voice chat. Currently, only Unix-like systems running
 PulseAudio are supported, although support for other OSes and sound servers may
 be added in the future.
 
-**The PulseAudio driver is not currently compatible with PipeWire's
-compatibility layer. For more information, please see
-[issue #9](https://github.com/hal7df/bardcast/issues/9). Native PipeWire support
-is being tracked in [issue #4](https://github.com/hal7df/bardcast/issues/4).**
-
 # Building
 bardcast needs the following libraries available on your system:
 
