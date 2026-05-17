@@ -22,7 +22,7 @@ use serenity::model::id::{ChannelId, GuildId};
 use serenity::model::user::User;
 use serenity::prelude::SerenityError;
 use songbird::{Call, Songbird};
-use songbird::input::{Input, RawAdapter};
+use songbird::input::{AudioStream as SongbirdAudioStream, Input, LiveInput, RawAdapter};
 use songbird::input::core::io::MediaSource;
 use songbird::tracks::{ControlError, TrackHandle};
 use stream_flatten_iters::TryStreamExt as _;
@@ -458,11 +458,16 @@ where S: Read + StreamNotifier + Send + Sync + 'static {
         stream_lease.await_samples().await;
 
         //Start playback
-        Some(call.lock().await.play_only_input(Input::from(RawAdapter::new(
-            MediaSourceAdapter::from(stream_lease),
-            STREAM_SAMPLE_RATE,
-            STREAM_CHANNELS
-        ))))
+        Some(call.lock().await.play_only_input(Input::Live(
+            LiveInput::Raw(SongbirdAudioStream {
+                input: Box::new(RawAdapter::new(
+                    MediaSourceAdapter::from(stream_lease),
+                    STREAM_SAMPLE_RATE,
+                    STREAM_CHANNELS,
+                )),
+            }),
+            None
+        )))
     } else {
         //Wait for playback to terminate naturally, and reclaim the stream
         stream.await_release().await;
