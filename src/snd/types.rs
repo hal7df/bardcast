@@ -53,6 +53,7 @@ pub trait AudioStream {
 
     /// Converts this `AudioStream` into a usable AsyncRead + StreamNotifier
     /// implementation.
+    #[allow(dead_code)]
     fn into_async_stream(self) -> Self::AsyncImpl;
 }
 
